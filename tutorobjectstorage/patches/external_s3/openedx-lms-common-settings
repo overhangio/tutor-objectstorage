@@ -1,7 +1,8 @@
+{# common-settings, not production-settings: the latter only renders into lms/production.py. STORAGES["profile_image"], not PROFILE_IMAGE_BACKEND: get_profile_image_storage() prefers it, and S3Storage rejects PROFILE_IMAGE_BACKEND's base_url kwarg. #}
 {% if OBJSTORAGE_BACKEND == "external_s3" and OBJSTORAGE_EXTERNAL_S3_PROFILE_IMAGE_BUCKET %}
-PROFILE_IMAGE_BACKEND = {
-    "class": STORAGES["default"]["BACKEND"],
-    "options": {
+STORAGES["profile_image"] = {
+    "BACKEND": STORAGES["default"]["BACKEND"],
+    "OPTIONS": {
         "bucket_name": "{{ OBJSTORAGE_EXTERNAL_S3_PROFILE_IMAGE_BUCKET }}",
         "location": PROFILE_IMAGE_BACKEND["options"]["location"].lstrip("/"),
         {% if OBJSTORAGE_EXTERNAL_S3_PROFILE_IMAGE_CUSTOM_DOMAIN %}"custom_domain": "{{ OBJSTORAGE_EXTERNAL_S3_PROFILE_IMAGE_CUSTOM_DOMAIN }}",{% endif %}

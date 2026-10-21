@@ -4,6 +4,21 @@
 
 ## Unreleased
 
+- [Bugfix] Profile images never reached object storage under `tutor dev`,
+  in all three backends - two compounding bugs, both masked by `tutor
+  local` never hitting the code paths that expose them. (1) Each backend
+  registered its override under Tutor's `openedx-lms-production-settings`
+  patch point, which only renders into `lms/production.py` - renamed to
+  `openedx-lms-common-settings` (also what tutor-contrib-s3 uses). (2)
+  Once applied in dev, the override's full replacement of
+  `PROFILE_IMAGE_BACKEND` broke `lms/urls.py`'s dev-only `DEBUG=True`
+  static-serving route, which reads that setting directly and expects a
+  `base_url` key `S3Storage` doesn't accept. Fixed by leaving
+  `PROFILE_IMAGE_BACKEND` untouched and setting `STORAGES["profile_image"]`
+  instead - `get_profile_image_storage()` prefers it when present. New
+  regression test renders the full `lms/development.py` /
+  `lms/production.py` templates and checks the override's own dict.
+
 - [Bugfix] The `rustfs` backend's console login failed with
   `SignatureDoesNotMatch: missing signed header: content-type`, which
   looked like a credentials problem but wasn't one - found live, debugging

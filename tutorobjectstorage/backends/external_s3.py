@@ -34,7 +34,7 @@ BACKEND = Backend(
         "CUSTOM_DOMAIN": "",
         "PROFILE_IMAGE_CUSTOM_DOMAIN": "",
         # Defaults to the shared OBJSTORAGE_BUCKET_NAME (see
-        # patches/external_s3/openedx-lms-production-settings) but can be
+        # patches/external_s3/openedx-lms-common-settings) but can be
         # set empty to keep profile images on local filesystem, exactly
         # reproducing tutor-contrib-s3's S3_PROFILE_IMAGE_BUCKET behavior.
         "PROFILE_IMAGE_BUCKET": "{{ OBJSTORAGE_BUCKET_NAME }}",
