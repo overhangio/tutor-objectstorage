@@ -1,4 +1,4 @@
-Object storage for Open edX: pick a backend, not a plugin
+Object storage for Open edX
 ===========================================================
 
 This is a plugin for `Tutor <https://docs.tutor.edly.io>`_ that configures Open
