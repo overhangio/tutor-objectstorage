@@ -1,7 +1,8 @@
+{# STORAGES["profile_image"], not PROFILE_IMAGE_BACKEND: get_profile_image_storage() prefers it, and S3Storage rejects PROFILE_IMAGE_BACKEND's base_url kwarg. #}
 {% if OBJSTORAGE_BACKEND == "azure" and OBJSTORAGE_AZURE_ACKNOWLEDGE_RISK %}
-PROFILE_IMAGE_BACKEND = {
-    "class": STORAGES["default"]["BACKEND"],
-    "options": {
+STORAGES["profile_image"] = {
+    "BACKEND": STORAGES["default"]["BACKEND"],
+    "OPTIONS": {
         "bucket_name": "{{ OBJSTORAGE_BUCKET_NAME }}",
         "querystring_auth": False,
         "location": PROFILE_IMAGE_BACKEND["options"]["location"].lstrip("/"),

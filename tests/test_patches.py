@@ -40,7 +40,7 @@ PYTHON_PATCHES = {
     "openedx-cms-common-settings",
     "openedx-common-settings",
     "openedx-development-settings",
-    "openedx-lms-production-settings",
+    "openedx-lms-common-settings",
     "xqueue-settings",
 }
 CADDYFILE_PATCHES = {"caddyfile"}
@@ -118,6 +118,42 @@ def test_python_patches_are_syntactically_valid(
             )
             continue
         compile(text, name, "exec")  # must not raise
+
+
+# Renders the composite settings files (not just the isolated patch) so a
+# patch registered under the wrong Tutor hook name shows up here too.
+# Checks STORAGES["profile_image"], not PROFILE_IMAGE_BACKEND:
+# get_profile_image_storage() prefers the former when present, and
+# S3Storage rejects PROFILE_IMAGE_BACKEND's base_url kwarg (confirmed
+# live - lms/urls.py needs base_url on PROFILE_IMAGE_BACKEND itself for
+# its dev-mode static() route, so that setting must stay untouched).
+@pytest.mark.parametrize("backend", BACKENDS)
+def test_profile_image_s3_override_applies_in_both_dev_and_production(
+    backend: str, config_by_backend: dict[str, t.Any]
+) -> None:
+    cfg = config_by_backend[backend]
+    bucket_name = cfg["OBJSTORAGE_BUCKET_NAME"]
+    for settings_file in ("development.py", "production.py"):
+        rendered = tutor_env.render_file(
+            cfg, "apps", "openedx", "settings", "lms", settings_file
+        )
+        assert isinstance(rendered, str)
+        start = rendered.rfind('STORAGES["profile_image"] = {')
+        assert start != -1, (
+            f"{backend}/lms/{settings_file}: the S3 STORAGES['profile_image'] "
+            "override never rendered - profile images would stay on local "
+            "disk under this settings file"
+        )
+        block = rendered[start : rendered.index("\n}\n", start) + 3]
+        assert f'"bucket_name": "{bucket_name}"' in block, (
+            f"{backend}/lms/{settings_file}: STORAGES['profile_image'] did "
+            "not pick up the configured bucket name"
+        )
+        assert '"base_url"' not in block, (
+            f"{backend}/lms/{settings_file}: STORAGES['profile_image'] "
+            "options must not include base_url - S3Storage rejects it as "
+            "an invalid kwarg"
+        )
 
 
 def test_caddyfile_is_empty_for_external_s3(
