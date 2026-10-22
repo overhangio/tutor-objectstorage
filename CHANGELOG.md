@@ -15,11 +15,11 @@
   treatment as Verawood/Ulmo in both dev and production: a thin wrapper
   storage class (referenced via a self-referential `__name__`-based path)
   strips the `base_url` key Teak's `lms/urls.py` still needs before
-  delegating to `S3Boto3Storage`. Verified live against a real Tutor 20.0.5
-  environment: LMS, CMS and Discovery boot cleanly and read/write through
-  all three backends, in both `tutor dev` and `tutor local launch`; the
-  existing Ulmo/Verawood behavior is unchanged (same live re-check, same
-  passing test suite). `pyproject.toml`'s `tutor` dependency now reads
+  delegating to `S3Boto3Storage`. Verified live against real Tutor 20.0.5
+  (Teak), 21.0.9 (Ulmo) and 22.0.2 (Verawood) environments: LMS, CMS and
+  Discovery boot cleanly and read/write through all three backends on every
+  version, including `tutor local launch` on Teak for the production
+  (`DEBUG=False`) code path. `pyproject.toml`'s `tutor` dependency now reads
   `>=20.0.0,<23.0.0`.
 
 - [Bugfix] Profile images never reached object storage under `tutor dev`,
