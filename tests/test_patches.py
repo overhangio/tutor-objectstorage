@@ -12,6 +12,8 @@ from __future__ import annotations
 
 import importlib
 import re
+import sys
+import types
 import typing as t
 
 import pytest
@@ -144,7 +146,22 @@ def test_profile_image_s3_override_applies_in_both_dev_and_production(
             "override never rendered - profile images would stay on local "
             "disk under this settings file"
         )
-        block = rendered[start : rendered.index("\n}\n", start) + 3]
+        # Brace-depth scan, not a literal "\n}\n" search: the dict literal is
+        # now nested inside an `if "STORAGES" in globals():` branch (Teak
+        # compat), so its closing brace is indented and would otherwise be
+        # skipped in favor of some unrelated later top-level "}" - silently
+        # swallowing the Teak else-branch's unrelated code into "block".
+        open_brace = rendered.index("{", start)
+        depth = 0
+        end = open_brace
+        for end, ch in enumerate(rendered[open_brace:], start=open_brace):
+            if ch == "{":
+                depth += 1
+            elif ch == "}":
+                depth -= 1
+                if depth == 0:
+                    break
+        block = rendered[start : end + 1]
         assert f'"bucket_name": "{bucket_name}"' in block, (
             f"{backend}/lms/{settings_file}: STORAGES['profile_image'] did "
             "not pick up the configured bucket name"
@@ -154,6 +171,228 @@ def test_profile_image_s3_override_applies_in_both_dev_and_production(
             "options must not include base_url - S3Storage rejects it as "
             "an invalid kwarg"
         )
+
+
+# --- Teak (Tutor 20.x) backward compatibility: exec, not just compile ------
+# test_python_patches_are_syntactically_valid only compile()s - it would
+# pass on code that raises NameError/ImproperlyConfigured the instant it
+# actually runs, exactly the bug these patches fix (confirmed live against a
+# real Tutor 20.0.5 + Teak edx-platform: `NameError: name 'STORAGES' is not
+# defined`). These exec() the real rendered patches against two fabricated
+# namespaces standing in for each era's pre-existing settings-module state.
+# This is the durable regression guard: CI always resolves the newest Tutor
+# satisfying pyproject.toml's range, so it will never actually install Tutor
+# 20.x itself even after widening that range.
+
+
+class _FakeS3Boto3Storage:
+    """Stand-in for storages.backends.s3boto3.S3Boto3Storage: django-storages
+    is a dependency of the edx-platform venv these patches actually execute
+    inside, not of this plugin's own test environment."""
+
+    def __init__(self, **kwargs: t.Any) -> None:
+        self.kwargs = kwargs
+
+
+class _FakeBotoConfig:
+    """Stand-in for botocore.client.Config: botocore/boto3 are dependencies
+    of the edx-platform venv these patches actually execute inside, not of
+    this plugin's own test environment (confirmed: whether `import botocore`
+    succeeds here depends on what happens to be installed transitively in
+    whichever venv runs these tests, so it must be stubbed rather than relied
+    on)."""
+
+    def __init__(self, **kwargs: t.Any) -> None:
+        self.kwargs = kwargs
+
+
+def _install_fake_s3_runtime_modules(monkeypatch: pytest.MonkeyPatch) -> None:
+    s3boto3_mod = types.ModuleType("storages.backends.s3boto3")
+    s3boto3_mod.S3Boto3Storage = _FakeS3Boto3Storage  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "storages", types.ModuleType("storages"))
+    monkeypatch.setitem(
+        sys.modules, "storages.backends", types.ModuleType("storages.backends")
+    )
+    monkeypatch.setitem(sys.modules, "storages.backends.s3boto3", s3boto3_mod)
+
+    client_mod = types.ModuleType("botocore.client")
+    client_mod.Config = _FakeBotoConfig  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "botocore", types.ModuleType("botocore"))
+    monkeypatch.setitem(sys.modules, "botocore.client", client_mod)
+
+
+def _base_namespace() -> dict[str, t.Any]:
+    return {
+        "__name__": "lms.envs.tutor.development",
+        "VIDEO_IMAGE_SETTINGS": {"STORAGE_KWARGS": {"location": "/video-images/"}},
+        "VIDEO_TRANSCRIPTS_SETTINGS": {
+            "STORAGE_KWARGS": {"location": "/video-transcripts/"}
+        },
+        "GRADES_DOWNLOAD": {"STORAGE_KWARGS": {"location": "/grades/"}},
+    }
+
+
+def _teak_namespace() -> dict[str, t.Any]:
+    """No STORAGES, no OPENEDX_LEARNING - confirmed absent from Teak's real
+    edx-platform source even though it runs Django 4.2.20. PROFILE_IMAGE_
+    BACKEND is in the old shape get_profile_image_storage() reads directly,
+    base_url included (lms/urls.py's dev-mode static() route needs it)."""
+    ns = _base_namespace()
+    ns["PROFILE_IMAGE_BACKEND"] = {
+        "class": "storages.backends.s3boto3.S3Boto3Storage",
+        "options": {
+            "location": "profile-images/",
+            "base_url": "/media/profile-images/",
+        },
+    }
+    return ns
+
+
+def _verawood_namespace() -> dict[str, t.Any]:
+    """STORAGES/OPENEDX_LEARNING pre-populated, matching Verawood/Ulmo's
+    real edx-platform settings-module state."""
+    ns = _base_namespace()
+    ns["STORAGES"] = {
+        "default": {"BACKEND": "django.core.files.storage.FileSystemStorage"}
+    }
+    ns["OPENEDX_LEARNING"] = {"MEDIA": {}}
+    ns["PROFILE_IMAGE_BACKEND"] = {
+        "class": "openedx.core.storage.OverwriteStorage",
+        "options": {"location": "profile-images/"},
+    }
+    return ns
+
+
+@pytest.mark.parametrize("backend", BACKENDS)
+def test_shared_settings_exec_cleanly_on_teak(
+    backend: str,
+    rendered_by_backend: dict[str, dict[str, str]],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _install_fake_s3_runtime_modules(monkeypatch)
+    ns = _teak_namespace()
+    exec(rendered_by_backend[backend]["openedx-common-settings"], ns)  # must not raise
+
+    assert "STORAGES" not in ns
+    assert ns["DEFAULT_FILE_STORAGE"] == "storages.backends.s3boto3.S3Boto3Storage"
+    assert "OPENEDX_LEARNING" not in ns, (
+        "OPENEDX_LEARNING doesn't exist in Teak's edx-platform at all - "
+        "the guard must not create it"
+    )
+
+
+@pytest.mark.parametrize("backend", BACKENDS)
+def test_shared_settings_exec_cleanly_on_verawood(
+    backend: str,
+    rendered_by_backend: dict[str, dict[str, str]],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _install_fake_s3_runtime_modules(monkeypatch)
+    ns = _verawood_namespace()
+    exec(rendered_by_backend[backend]["openedx-common-settings"], ns)  # must not raise
+
+    assert "DEFAULT_FILE_STORAGE" not in ns
+    assert (
+        ns["STORAGES"]["default"]["BACKEND"]
+        == "storages.backends.s3boto3.S3Boto3Storage"
+    )
+    assert (
+        ns["OPENEDX_LEARNING"]["MEDIA"]["BACKEND"]
+        == "storages.backends.s3boto3.S3Boto3Storage"
+    )
+
+
+@pytest.mark.parametrize("backend", BACKENDS)
+def test_lms_profile_image_exec_cleanly_on_teak(
+    backend: str,
+    rendered_by_backend: dict[str, dict[str, str]],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _install_fake_s3_runtime_modules(monkeypatch)
+    ns = _teak_namespace()
+    exec(rendered_by_backend[backend]["openedx-common-settings"], ns)
+    exec(
+        rendered_by_backend[backend]["openedx-lms-common-settings"], ns
+    )  # must not raise
+
+    assert "STORAGES" not in ns
+    backend_cls = ns["PROFILE_IMAGE_BACKEND"]["class"]
+    assert (
+        backend_cls == "lms.envs.tutor.development._ObjstorageProfileImageS3Storage"
+    ), (
+        "the wrapper class must be referenced via a self-referential "
+        "__name__-based dotted path, not a hardcoded module"
+    )
+    options = ns["PROFILE_IMAGE_BACKEND"]["options"]
+    assert "base_url" in options, (
+        "lms/urls.py's dev-mode static() route reads "
+        "PROFILE_IMAGE_BACKEND['options']['base_url'] directly - it must stay"
+    )
+
+    # The wrapper itself must actually strip base_url before delegating,
+    # confirmed live against the real Teak image - S3Storage otherwise
+    # rejects it as an unrecognized constructor kwarg.
+    wrapper_cls = ns["_ObjstorageProfileImageS3Storage"]
+    instance = wrapper_cls(**options)
+    assert "base_url" not in instance.kwargs
+    assert instance.kwargs["location"] == options["location"]
+
+
+@pytest.mark.parametrize("backend", BACKENDS)
+def test_lms_profile_image_exec_cleanly_on_verawood(
+    backend: str,
+    rendered_by_backend: dict[str, dict[str, str]],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _install_fake_s3_runtime_modules(monkeypatch)
+    ns = _verawood_namespace()
+    exec(rendered_by_backend[backend]["openedx-common-settings"], ns)
+    exec(
+        rendered_by_backend[backend]["openedx-lms-common-settings"], ns
+    )  # must not raise
+
+    assert ns["STORAGES"]["profile_image"]["OPTIONS"]["location"] == "profile-images/"
+    assert "_ObjstorageProfileImageS3Storage" not in ns
+    assert (
+        ns["PROFILE_IMAGE_BACKEND"]["class"] == "openedx.core.storage.OverwriteStorage"
+    )
+
+
+@pytest.mark.parametrize("backend", BACKENDS)
+def test_discovery_settings_exec_cleanly_on_teak(
+    backend: str,
+    rendered_by_backend: dict[str, dict[str, str]],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _install_fake_s3_runtime_modules(monkeypatch)
+    ns: dict[str, t.Any] = {}
+    # must not raise
+    exec(rendered_by_backend[backend]["discovery-common-settings"], ns)
+
+    assert "STORAGES" not in ns
+    assert ns["DEFAULT_FILE_STORAGE"] == "storages.backends.s3boto3.S3Boto3Storage"
+
+
+@pytest.mark.parametrize("backend", BACKENDS)
+def test_discovery_settings_exec_cleanly_on_verawood(
+    backend: str,
+    rendered_by_backend: dict[str, dict[str, str]],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _install_fake_s3_runtime_modules(monkeypatch)
+    ns: dict[str, t.Any] = {
+        "STORAGES": {
+            "default": {"BACKEND": "django.core.files.storage.FileSystemStorage"}
+        }
+    }
+    # must not raise
+    exec(rendered_by_backend[backend]["discovery-common-settings"], ns)
+
+    assert "DEFAULT_FILE_STORAGE" not in ns
+    assert (
+        ns["STORAGES"]["default"]["BACKEND"]
+        == "storages.backends.s3boto3.S3Boto3Storage"
+    )
 
 
 def test_caddyfile_is_empty_for_external_s3(

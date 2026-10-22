@@ -233,3 +233,7 @@ def test_tutor_dependency_does_not_exclude_current_tutor_releases() -> None:
         "excludes tutor 22.0.2, the version every other current Tutor plugin "
         "requires - this would silently downgrade Tutor on install"
     )
+    assert tutor_requirement.specifier.contains(Version("20.0.5"), prereleases=True), (
+        f"tutor-objectstorage's own 'tutor' dependency ({tutor_requirement.specifier}) "
+        "excludes tutor 20.0.5 (Teak) - this plugin is meant to support Teak too"
+    )
