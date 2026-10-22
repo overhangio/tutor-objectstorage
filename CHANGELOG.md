@@ -4,6 +4,24 @@
 
 ## Unreleased
 
+- [Feature] Support Tutor 20.x (Teak), in addition to the already-supported
+  21.x/22.x (Ulmo/Verawood). Teak's edx-platform and course-discovery still
+  use Django's old `DEFAULT_FILE_STORAGE` string setting instead of the
+  `STORAGES` dict, so every settings patch that touches `STORAGES` now
+  branches on `"STORAGES" in globals()` rather than the Django version
+  (Teak itself runs Django 4.2.20 too, so a version check would get this
+  backwards - this is the same presence-detection idiom edx-platform's own
+  `resolve_storage_backend()` uses). Profile images get the same full S3
+  treatment as Verawood/Ulmo in both dev and production: a thin wrapper
+  storage class (referenced via a self-referential `__name__`-based path)
+  strips the `base_url` key Teak's `lms/urls.py` still needs before
+  delegating to `S3Boto3Storage`. Verified live against a real Tutor 20.0.5
+  environment: LMS, CMS and Discovery boot cleanly and read/write through
+  all three backends, in both `tutor dev` and `tutor local launch`; the
+  existing Ulmo/Verawood behavior is unchanged (same live re-check, same
+  passing test suite). `pyproject.toml`'s `tutor` dependency now reads
+  `>=20.0.0,<23.0.0`.
+
 - [Bugfix] Profile images never reached object storage under `tutor dev`,
   in all three backends - two compounding bugs, both masked by `tutor
   local` never hitting the code paths that expose them. (1) Each backend

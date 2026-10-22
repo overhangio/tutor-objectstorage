@@ -1,11 +1,28 @@
-{# STORAGES["profile_image"], not PROFILE_IMAGE_BACKEND: get_profile_image_storage() prefers it, and S3Storage rejects PROFILE_IMAGE_BACKEND's base_url kwarg. #}
+{# Verawood/Ulmo: STORAGES["profile_image"], not PROFILE_IMAGE_BACKEND - get_profile_image_storage() prefers it, and S3Storage rejects PROFILE_IMAGE_BACKEND's base_url kwarg.
+   Teak: get_profile_image_storage() only ever reads PROFILE_IMAGE_BACKEND directly, spreading its whole "options" dict as constructor kwargs - so base_url has to stay in that dict for lms/urls.py's dev-mode static() route, while S3Storage itself rejects that same kwarg. A thin wrapper class that discards it before delegating resolves both needs without touching edx-platform. Confirmed live against the real Teak image. #}
 {% if OBJSTORAGE_BACKEND == "rustfs" %}
-STORAGES["profile_image"] = {
-    "BACKEND": STORAGES["default"]["BACKEND"],
-    "OPTIONS": {
+if "STORAGES" in globals():
+    STORAGES["profile_image"] = {
+        "BACKEND": STORAGES["default"]["BACKEND"],
+        "OPTIONS": {
+            "bucket_name": "{{ OBJSTORAGE_BUCKET_NAME }}",
+            "querystring_auth": False,
+            "location": PROFILE_IMAGE_BACKEND["options"]["location"].lstrip("/"),
+        },
+    }
+else:
+    from storages.backends.s3boto3 import S3Boto3Storage as _objstorage_s3_base
+
+    class _ObjstorageProfileImageS3Storage(_objstorage_s3_base):
+        def __init__(self, **kwargs):
+            kwargs.pop("base_url", None)
+            super().__init__(**kwargs)
+
+    PROFILE_IMAGE_BACKEND["class"] = __name__ + "._ObjstorageProfileImageS3Storage"
+    PROFILE_IMAGE_BACKEND["options"] = {
         "bucket_name": "{{ OBJSTORAGE_BUCKET_NAME }}",
         "querystring_auth": False,
         "location": PROFILE_IMAGE_BACKEND["options"]["location"].lstrip("/"),
-    },
-}
+        "base_url": PROFILE_IMAGE_BACKEND["options"]["base_url"],
+    }
 {% endif %}
