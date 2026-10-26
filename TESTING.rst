@@ -191,6 +191,17 @@ rustfs::
     export OBJSTORAGE_TEST_SECRET_KEY="$(tutor config printvalue OPENEDX_AWS_SECRET_ACCESS_KEY)"
     pytest -v tests/test_s3_conformance_rustfs.py
 
+The two CORS tests in that file (``test_cors_header_present_and_not_
+duplicated_on_public_bucket``, ``test_cors_preflight_succeeds_on_presigned_
+private_bucket_url``) specifically exercise the Caddy-level fix in
+``patches/rustfs/caddyfile`` — ``localhost:9000`` above talks directly to
+the ``rustfs`` container, bypassing Caddy entirely, the same way dev
+mode's own settings do (see ``patches/rustfs/openedx-development-
+settings``). Point ``OBJSTORAGE_TEST_ENDPOINT`` at the Caddy-fronted host
+instead (``http://<OBJSTORAGE_RUSTFS_HOST>``, reachable from a ``tutor
+local launch`` deployment, not ``tutor dev``) to exercise those two
+specifically; every other test in the file works identically either way.
+
 azure — **run this in `tutor local launch` mode, not `tutor dev`**: dev mode
 runs no Caddy at all, so the public/private bucket split this suite spends
 most of its time testing cannot exist there::

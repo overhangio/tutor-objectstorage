@@ -12,6 +12,8 @@ from __future__ import annotations
 
 import importlib
 import re
+import sys
+import types
 import typing as t
 
 import pytest
@@ -144,7 +146,22 @@ def test_profile_image_s3_override_applies_in_both_dev_and_production(
             "override never rendered - profile images would stay on local "
             "disk under this settings file"
         )
-        block = rendered[start : rendered.index("\n}\n", start) + 3]
+        # Brace-depth scan, not a literal "\n}\n" search: the dict literal is
+        # now nested inside an `if "STORAGES" in globals():` branch (Teak
+        # compat), so its closing brace is indented and would otherwise be
+        # skipped in favor of some unrelated later top-level "}" - silently
+        # swallowing the Teak else-branch's unrelated code into "block".
+        open_brace = rendered.index("{", start)
+        depth = 0
+        end = open_brace
+        for end, ch in enumerate(rendered[open_brace:], start=open_brace):
+            if ch == "{":
+                depth += 1
+            elif ch == "}":
+                depth -= 1
+                if depth == 0:
+                    break
+        block = rendered[start : end + 1]
         assert f'"bucket_name": "{bucket_name}"' in block, (
             f"{backend}/lms/{settings_file}: STORAGES['profile_image'] did "
             "not pick up the configured bucket name"
@@ -154,6 +171,228 @@ def test_profile_image_s3_override_applies_in_both_dev_and_production(
             "options must not include base_url - S3Storage rejects it as "
             "an invalid kwarg"
         )
+
+
+# --- Teak (Tutor 20.x) backward compatibility: exec, not just compile ------
+# test_python_patches_are_syntactically_valid only compile()s - it would
+# pass on code that raises NameError/ImproperlyConfigured the instant it
+# actually runs, exactly the bug these patches fix (confirmed live against a
+# real Tutor 20.0.5 + Teak edx-platform: `NameError: name 'STORAGES' is not
+# defined`). These exec() the real rendered patches against two fabricated
+# namespaces standing in for each era's pre-existing settings-module state.
+# This is the durable regression guard: CI always resolves the newest Tutor
+# satisfying pyproject.toml's range, so it will never actually install Tutor
+# 20.x itself even after widening that range.
+
+
+class _FakeS3Boto3Storage:
+    """Stand-in for storages.backends.s3boto3.S3Boto3Storage: django-storages
+    is a dependency of the edx-platform venv these patches actually execute
+    inside, not of this plugin's own test environment."""
+
+    def __init__(self, **kwargs: t.Any) -> None:
+        self.kwargs = kwargs
+
+
+class _FakeBotoConfig:
+    """Stand-in for botocore.client.Config: botocore/boto3 are dependencies
+    of the edx-platform venv these patches actually execute inside, not of
+    this plugin's own test environment (confirmed: whether `import botocore`
+    succeeds here depends on what happens to be installed transitively in
+    whichever venv runs these tests, so it must be stubbed rather than relied
+    on)."""
+
+    def __init__(self, **kwargs: t.Any) -> None:
+        self.kwargs = kwargs
+
+
+def _install_fake_s3_runtime_modules(monkeypatch: pytest.MonkeyPatch) -> None:
+    s3boto3_mod = types.ModuleType("storages.backends.s3boto3")
+    s3boto3_mod.S3Boto3Storage = _FakeS3Boto3Storage  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "storages", types.ModuleType("storages"))
+    monkeypatch.setitem(
+        sys.modules, "storages.backends", types.ModuleType("storages.backends")
+    )
+    monkeypatch.setitem(sys.modules, "storages.backends.s3boto3", s3boto3_mod)
+
+    client_mod = types.ModuleType("botocore.client")
+    client_mod.Config = _FakeBotoConfig  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "botocore", types.ModuleType("botocore"))
+    monkeypatch.setitem(sys.modules, "botocore.client", client_mod)
+
+
+def _base_namespace() -> dict[str, t.Any]:
+    return {
+        "__name__": "lms.envs.tutor.development",
+        "VIDEO_IMAGE_SETTINGS": {"STORAGE_KWARGS": {"location": "/video-images/"}},
+        "VIDEO_TRANSCRIPTS_SETTINGS": {
+            "STORAGE_KWARGS": {"location": "/video-transcripts/"}
+        },
+        "GRADES_DOWNLOAD": {"STORAGE_KWARGS": {"location": "/grades/"}},
+    }
+
+
+def _teak_namespace() -> dict[str, t.Any]:
+    """No STORAGES, no OPENEDX_LEARNING - confirmed absent from Teak's real
+    edx-platform source even though it runs Django 4.2.20. PROFILE_IMAGE_
+    BACKEND is in the old shape get_profile_image_storage() reads directly,
+    base_url included (lms/urls.py's dev-mode static() route needs it)."""
+    ns = _base_namespace()
+    ns["PROFILE_IMAGE_BACKEND"] = {
+        "class": "storages.backends.s3boto3.S3Boto3Storage",
+        "options": {
+            "location": "profile-images/",
+            "base_url": "/media/profile-images/",
+        },
+    }
+    return ns
+
+
+def _verawood_namespace() -> dict[str, t.Any]:
+    """STORAGES/OPENEDX_LEARNING pre-populated, matching Verawood/Ulmo's
+    real edx-platform settings-module state."""
+    ns = _base_namespace()
+    ns["STORAGES"] = {
+        "default": {"BACKEND": "django.core.files.storage.FileSystemStorage"}
+    }
+    ns["OPENEDX_LEARNING"] = {"MEDIA": {}}
+    ns["PROFILE_IMAGE_BACKEND"] = {
+        "class": "openedx.core.storage.OverwriteStorage",
+        "options": {"location": "profile-images/"},
+    }
+    return ns
+
+
+@pytest.mark.parametrize("backend", BACKENDS)
+def test_shared_settings_exec_cleanly_on_teak(
+    backend: str,
+    rendered_by_backend: dict[str, dict[str, str]],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _install_fake_s3_runtime_modules(monkeypatch)
+    ns = _teak_namespace()
+    exec(rendered_by_backend[backend]["openedx-common-settings"], ns)  # must not raise
+
+    assert "STORAGES" not in ns
+    assert ns["DEFAULT_FILE_STORAGE"] == "storages.backends.s3boto3.S3Boto3Storage"
+    assert "OPENEDX_LEARNING" not in ns, (
+        "OPENEDX_LEARNING doesn't exist in Teak's edx-platform at all - "
+        "the guard must not create it"
+    )
+
+
+@pytest.mark.parametrize("backend", BACKENDS)
+def test_shared_settings_exec_cleanly_on_verawood(
+    backend: str,
+    rendered_by_backend: dict[str, dict[str, str]],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _install_fake_s3_runtime_modules(monkeypatch)
+    ns = _verawood_namespace()
+    exec(rendered_by_backend[backend]["openedx-common-settings"], ns)  # must not raise
+
+    assert "DEFAULT_FILE_STORAGE" not in ns
+    assert (
+        ns["STORAGES"]["default"]["BACKEND"]
+        == "storages.backends.s3boto3.S3Boto3Storage"
+    )
+    assert (
+        ns["OPENEDX_LEARNING"]["MEDIA"]["BACKEND"]
+        == "storages.backends.s3boto3.S3Boto3Storage"
+    )
+
+
+@pytest.mark.parametrize("backend", BACKENDS)
+def test_lms_profile_image_exec_cleanly_on_teak(
+    backend: str,
+    rendered_by_backend: dict[str, dict[str, str]],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _install_fake_s3_runtime_modules(monkeypatch)
+    ns = _teak_namespace()
+    exec(rendered_by_backend[backend]["openedx-common-settings"], ns)
+    exec(
+        rendered_by_backend[backend]["openedx-lms-common-settings"], ns
+    )  # must not raise
+
+    assert "STORAGES" not in ns
+    backend_cls = ns["PROFILE_IMAGE_BACKEND"]["class"]
+    assert (
+        backend_cls == "lms.envs.tutor.development._ObjstorageProfileImageS3Storage"
+    ), (
+        "the wrapper class must be referenced via a self-referential "
+        "__name__-based dotted path, not a hardcoded module"
+    )
+    options = ns["PROFILE_IMAGE_BACKEND"]["options"]
+    assert "base_url" in options, (
+        "lms/urls.py's dev-mode static() route reads "
+        "PROFILE_IMAGE_BACKEND['options']['base_url'] directly - it must stay"
+    )
+
+    # The wrapper itself must actually strip base_url before delegating,
+    # confirmed live against the real Teak image - S3Storage otherwise
+    # rejects it as an unrecognized constructor kwarg.
+    wrapper_cls = ns["_ObjstorageProfileImageS3Storage"]
+    instance = wrapper_cls(**options)
+    assert "base_url" not in instance.kwargs
+    assert instance.kwargs["location"] == options["location"]
+
+
+@pytest.mark.parametrize("backend", BACKENDS)
+def test_lms_profile_image_exec_cleanly_on_verawood(
+    backend: str,
+    rendered_by_backend: dict[str, dict[str, str]],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _install_fake_s3_runtime_modules(monkeypatch)
+    ns = _verawood_namespace()
+    exec(rendered_by_backend[backend]["openedx-common-settings"], ns)
+    exec(
+        rendered_by_backend[backend]["openedx-lms-common-settings"], ns
+    )  # must not raise
+
+    assert ns["STORAGES"]["profile_image"]["OPTIONS"]["location"] == "profile-images/"
+    assert "_ObjstorageProfileImageS3Storage" not in ns
+    assert (
+        ns["PROFILE_IMAGE_BACKEND"]["class"] == "openedx.core.storage.OverwriteStorage"
+    )
+
+
+@pytest.mark.parametrize("backend", BACKENDS)
+def test_discovery_settings_exec_cleanly_on_teak(
+    backend: str,
+    rendered_by_backend: dict[str, dict[str, str]],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _install_fake_s3_runtime_modules(monkeypatch)
+    ns: dict[str, t.Any] = {}
+    # must not raise
+    exec(rendered_by_backend[backend]["discovery-common-settings"], ns)
+
+    assert "STORAGES" not in ns
+    assert ns["DEFAULT_FILE_STORAGE"] == "storages.backends.s3boto3.S3Boto3Storage"
+
+
+@pytest.mark.parametrize("backend", BACKENDS)
+def test_discovery_settings_exec_cleanly_on_verawood(
+    backend: str,
+    rendered_by_backend: dict[str, dict[str, str]],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _install_fake_s3_runtime_modules(monkeypatch)
+    ns: dict[str, t.Any] = {
+        "STORAGES": {
+            "default": {"BACKEND": "django.core.files.storage.FileSystemStorage"}
+        }
+    }
+    # must not raise
+    exec(rendered_by_backend[backend]["discovery-common-settings"], ns)
+
+    assert "DEFAULT_FILE_STORAGE" not in ns
+    assert (
+        ns["STORAGES"]["default"]["BACKEND"]
+        == "storages.backends.s3boto3.S3Boto3Storage"
+    )
 
 
 def test_caddyfile_is_empty_for_external_s3(
@@ -302,6 +541,85 @@ def test_azure_init_script_has_no_bucket_policy_step() -> None:
             assert forbidden not in lowered, f"unexpected {forbidden!r} in: {line!r}"
 
 
+# --- the azure backend must not double up rclone's own CORS headers, and
+# --- must answer OPTIONS itself -----------------------------------------
+# Confirmed live, through the real Caddy + rclonegw stack: rclone's `serve
+# s3` already emits its own complete Access-Control-* headers on a real
+# GET/HEAD/PUT/etc. response. The *previous* version of this Caddyfile
+# unconditionally added its own `header Access-Control-Allow-Origin *` on
+# top, producing the header *twice* on the actual response - a real
+# browser rejects that exactly like a missing header ("contains multiple
+# values '*, *', but only one is allowed"). Separately, `rclonegw`'s own
+# OPTIONS handling is never preflight-safe: against a presigned URL's
+# exact query string (what a real browser preflight actually requests)
+# it validates the signature regardless of method and answers a bare
+# `403 Forbidden`, since a presigned URL's signature is computed for the
+# method it was minted for (GET), never OPTIONS - and a preflight
+# response must be 2xx or the browser never sends the real request. Live
+# conformance regressions: test_cors_allow_origin_header_is_not_duplicated
+# and test_cors_preflight_succeeds_on_presigned_private_bucket_url in
+# test_s3_conformance_azure.py. This is the fast, offline guard for the
+# same fix at the template level.
+def test_azure_caddyfile_does_not_duplicate_cors_headers_and_handles_options(
+    base_config: dict[str, t.Any],
+) -> None:
+    from tests.conftest import render_for_backend
+
+    cfg = render_for_backend(base_config, "azure")
+    caddy = tutor_env.Renderer(cfg).patch("caddyfile")
+
+    assert caddy.count("header Access-Control-Allow-Origin") <= 1, (
+        "rclone's `serve s3` already sends its own Access-Control-Allow-Origin "
+        "on a real GET - adding a second one here duplicates it on the "
+        "response, which a browser rejects just like a missing header"
+    )
+
+    # A bare count doesn't confirm *where* the header lives: a future edit
+    # could move it out of the OPTIONS-only @cors_preflight block and into
+    # @public_read or the default handle{} block - both of which proxy
+    # real GET/HEAD/PUT traffic to rclone - and still pass the count check
+    # above (still exactly one occurrence), the OPTIONS regex below
+    # (untouched, still present in @cors_preflight) and the respond-204
+    # regex (ditto), even though that reintroduces the exact live
+    # duplicate-header bug this test exists to catch. Pin the header to
+    # the preflight-only block, and assert it is absent everywhere else in
+    # the file, so a misplaced header fails here instead of only showing
+    # up in the live conformance test.
+    preflight_match = re.search(
+        r"handle @cors_preflight \{(.*?)\n    \}", caddy, re.DOTALL
+    )
+    assert preflight_match is not None, (
+        "expected an OPTIONS-only `handle @cors_preflight` block"
+    )
+    assert "header Access-Control-Allow-Origin" in preflight_match.group(1), (
+        "the Access-Control-Allow-Origin header must be set inside the "
+        "OPTIONS-only preflight block, not on a path that also serves "
+        "real GET/HEAD/PUT responses"
+    )
+    rest_of_caddyfile = (
+        caddy[: preflight_match.start()] + caddy[preflight_match.end() :]
+    )
+    assert "header Access-Control-Allow-Origin" not in rest_of_caddyfile, (
+        "found outside the preflight block - rclone's `serve s3` already "
+        "sends its own Access-Control-Allow-Origin on a real GET/HEAD/PUT "
+        "response proxied through @public_read or the default handle{} "
+        "block, so adding a second one there duplicates it exactly like "
+        "the live bug this test guards against"
+    )
+
+    assert re.search(r"method\s+OPTIONS", caddy), (
+        "OPTIONS must be matched and answered directly at Caddy - "
+        "rclonegw's own OPTIONS handling validates a presigned URL's "
+        "signature against the wrong method and returns a bare 403, "
+        "which fails a real preflight outright"
+    )
+    assert re.search(r"respond\s+204", caddy), (
+        "the OPTIONS short-circuit must itself answer with a clean 2xx "
+        "status - a preflight fails if its response is not 2xx, "
+        "regardless of which headers ride along with it"
+    )
+
+
 def test_rustfs_init_script_never_sets_anonymous_public() -> None:
     script = read_task_script("rustfs")
     assert "anonymous set public" not in script
@@ -342,6 +660,45 @@ def test_rustfs_console_redirect_does_not_intercept_signed_requests(
         "the matcher must exclude presigned/query-signed requests (e.g. "
         "the console's own GET /?x-id=ListBuckets)"
     )
+
+
+# --- RustFS does not send CORS headers by default ---------------------------
+# Confirmed live, through the real Caddy-fronted stack: a direct OPTIONS
+# preflight against the rustfs container (bypassing Caddy) returns a bare
+# `200 OK` with zero Access-Control-* headers, and a real cross-origin
+# browser fetch against a presigned grade-report URL - the Data
+# Download/Instructor-dashboard download flow - was blocked with "No
+# 'Access-Control-Allow-Origin' header is present on the requested
+# resource." This contradicts EVALUATION.md's original comparison table
+# ("CORS | Requires proxy-layer headers | Native default" for azure vs.
+# rustfs): RustFS can do CORS (`rc bucket cors`), but does not do it by
+# default, the same as a fresh AWS S3 bucket. Fixed the same way the
+# `azure` backend already is: headers injected at the proxy. This is the
+# regression guard for that fix, scoped to the S3 API site block only (not
+# the console block, which browsers never fetch cross-origin).
+def test_rustfs_caddyfile_sets_cors_headers_on_s3_api(
+    base_config: dict[str, t.Any],
+) -> None:
+    from tests.conftest import render_for_backend
+
+    cfg = render_for_backend(base_config, "rustfs")
+    caddy = tutor_env.Renderer(cfg).patch("caddyfile")
+
+    s3_api_block = caddy.split("# RustFS web console.")[0]
+
+    assert "Access-Control-Allow-Origin *" in s3_api_block, (
+        "no cross-origin fetch/XHR against a presigned rustfs URL (e.g. "
+        "the Instructor Dashboard's grade-report download) will ever "
+        "succeed without this - confirmed live, RustFS does not send it "
+        "by default"
+    )
+    assert re.search(r"Access-Control-Allow-Methods\s+[\"']?.*GET", s3_api_block), (
+        "needed for a *preflighted* cross-origin request (one with "
+        "custom headers) to pass - confirmed live, a direct OPTIONS "
+        "preflight against the rustfs container returns 200 with no "
+        "Access-Control-* headers at all"
+    )
+    assert "Access-Control-Allow-Headers" in s3_api_block
 
 
 # --- hook-name validity ------------------------------------------------------

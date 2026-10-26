@@ -3,18 +3,39 @@
 # without going through Tutor's full rendering pipeline (test_patches.py
 # is what keeps the real, Jinja-templated patch honest). Bucket name and
 # ports are hardcoded to match docker-compose.ci.yml's defaults.
+#
+# Keep this in sync with tutorobjectstorage/patches/azure/caddyfile by
+# hand - this file is why Finding 7 (EVALUATION.md) slipped through
+# undetected for as long as it did: the real Caddyfile's CORS fix was
+# never mirrored here, so the two new live regression tests it added
+# (test_cors_allow_origin_header_is_not_duplicated and
+# test_cors_preflight_succeeds_on_presigned_private_bucket_url) would
+# have run against the *pre-fix* routing in CI and failed there even
+# after the real plugin template was fixed.
 :80 {
-    header Access-Control-Allow-Origin *
-    header Access-Control-Expose-Headers "Content-Range,Accept-Ranges,ETag"
+    @cors_preflight {
+        method OPTIONS
+    }
+    handle @cors_preflight {
+        header Access-Control-Allow-Origin *
+        header Access-Control-Allow-Methods "GET, HEAD, PUT, POST, DELETE, OPTIONS"
+        header Access-Control-Allow-Headers *
+        header Access-Control-Max-Age 86400
+        respond 204
+    }
 
     @public_read {
         method GET HEAD
         path /openedx/*
     }
     handle @public_read {
-        reverse_proxy rclonegw-public:9000
+        reverse_proxy rclonegw-public:9000 {
+            header_down Access-Control-Expose-Headers "Content-Range,Accept-Ranges,ETag"
+        }
     }
     handle {
-        reverse_proxy rclonegw:9000
+        reverse_proxy rclonegw:9000 {
+            header_down Access-Control-Expose-Headers "Content-Range,Accept-Ranges,ETag"
+        }
     }
 }

@@ -1,6 +1,10 @@
 {% if OBJSTORAGE_BACKEND == "external_s3" %}
 # External S3-compatible object storage
-STORAGES["default"]["BACKEND"] = "storages.backends.s3boto3.S3Boto3Storage"
+# Teak's course-discovery still uses DEFAULT_FILE_STORAGE (STORAGES arrives ~ulmo.1); presence-detection, not a django.VERSION check, for the same reason as the LMS/CMS patch.
+if "STORAGES" in globals():
+    STORAGES["default"]["BACKEND"] = "storages.backends.s3boto3.S3Boto3Storage"
+else:
+    DEFAULT_FILE_STORAGE = "storages.backends.s3boto3.S3Boto3Storage"
 AWS_ACCESS_KEY_ID = "{{ OPENEDX_AWS_ACCESS_KEY }}"
 AWS_SECRET_ACCESS_KEY = "{{ OPENEDX_AWS_SECRET_ACCESS_KEY }}"
 AWS_S3_SIGNATURE_VERSION = "s3v4"

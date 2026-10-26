@@ -64,6 +64,11 @@ def bucket() -> str:
     return os.environ.get("OBJSTORAGE_TEST_BUCKET", "openedx")
 
 
+@pytest.fixture(scope="module")
+def private_bucket() -> str:
+    return os.environ.get("OBJSTORAGE_TEST_PRIVATE_BUCKET", "openedxgrades")
+
+
 @pytest.fixture
 def key(s3: t.Any, bucket: str) -> t.Iterator[str]:
     name = f"tutor-objectstorage-rustfs-test/{uuid.uuid4()}.bin"
@@ -158,6 +163,75 @@ def test_anonymous_read_on_private_bucket_is_rejected(s3: t.Any) -> None:
         f"anonymous read of a PRIVATE bucket returned {response.status_code} - "
         "this is a real data leak, not a cosmetic issue"
     )
+
+
+# --- CORS: regression guard for the Caddy-level fix in patches/rustfs/caddyfile ---
+#
+# RustFS ships with no CORS headers configured by default (confirmed live:
+# a direct OPTIONS preflight against the rustfs container itself, bypassing
+# Caddy, returns a bare 200 OK with zero Access-Control-* headers) - unlike
+# the `azure` backend, where rclone's `serve s3` sends its own native
+# headers and the bug there was duplication, not absence. See
+# EVALUATION.md Finding 6/7 for the full history of both.
+
+
+def test_cors_header_present_and_not_duplicated_on_public_bucket(
+    bucket: str, key: str
+) -> None:
+    requests = pytest.importorskip("requests")
+    response = requests.get(
+        f"{ENDPOINT}/{bucket}/{key}",
+        headers={"Origin": "https://example.com"},
+        timeout=30,
+    )
+    value = response.headers.get("Access-Control-Allow-Origin", "")
+    assert value == "*", (
+        f"expected exactly one Access-Control-Allow-Origin value, got "
+        f"{value!r} - either missing (the original bug) or duplicated "
+        f"(the azure backend's distinct bug) would show up here as "
+        f"something other than a bare '*'"
+    )
+
+
+def test_cors_preflight_succeeds_on_presigned_private_bucket_url(
+    s3: t.Any, private_bucket: str
+) -> None:
+    """The Instructor Dashboard grade-report download flow this plugin's
+    whole CORS fix was found through: a presigned URL for a *private*
+    bucket, fetched by a real cross-origin preflighted request - not a
+    plain <a> link click, which isn't subject to CORS at all."""
+    requests = pytest.importorskip("requests")
+    name = f"tutor-objectstorage-rustfs-test/{uuid.uuid4()}.csv"
+    s3.put_object(Bucket=private_bucket, Key=name, Body=b"grade,report")
+    try:
+        url = s3.generate_presigned_url(
+            "get_object",
+            Params={"Bucket": private_bucket, "Key": name},
+            ExpiresIn=300,
+        )
+        response = requests.options(
+            url,
+            headers={
+                "Origin": "https://example.com",
+                "Access-Control-Request-Method": "GET",
+                "Access-Control-Request-Headers": "x-requested-with",
+            },
+            timeout=30,
+        )
+        assert response.ok, (
+            f"preflight against a presigned private-bucket URL returned "
+            f"{response.status_code}, not 2xx - a browser fails the whole "
+            f"request before the real GET is ever sent: {response.text[:400]}"
+        )
+        assert response.headers.get("Access-Control-Allow-Origin"), (
+            "preflight response is 2xx but carries no "
+            "Access-Control-Allow-Origin header"
+        )
+    finally:
+        try:
+            s3.delete_object(Bucket=private_bucket, Key=name)
+        except Exception:  # noqa: BLE001 - cleanup must not mask failures
+            pass
 
 
 def test_list_objects_v2(s3: t.Any, bucket: str, key: str) -> None:

@@ -4,6 +4,118 @@
 
 ## Unreleased
 
+- [Bugfix] The `rustfs` backend never sent CORS headers, breaking any
+  JS-driven cross-origin download against a presigned URL — found live
+  while investigating a teammate's report that downloading a course grade
+  report from the Instructor Dashboard threw `Access to fetch at
+  'http://files.../...grade_report....csv?X-Amz-...' ... has been blocked
+  by CORS policy: No 'Access-Control-Allow-Origin' header is present on the
+  requested resource.` on a Tutor 21.0.9 (Ulmo) `tutor local launch`
+  deployment. Reproduced through the real Caddy-fronted stack (not just at
+  the container level): a genuine cross-origin `fetch()`/XHR against a
+  presigned grade-report URL fails exactly this way; a plain `<a>` link
+  click does not, since navigations aren't subject to CORS — only a
+  script-driven fetch is, which is what any JS-based download flow (and
+  the reported browser console error) actually does. Root-caused to a
+  false assumption baked into this plugin since its initial release and
+  stated outright in `EVALUATION.md`'s own comparison table ("CORS | ...
+  | Native default" for `rustfs`): a direct `OPTIONS` preflight against
+  the `rustfs` container itself, bypassing Caddy, returns a bare `200 OK`
+  with zero `Access-Control-*` headers. RustFS can do CORS natively
+  (`rc bucket cors set`), but — exactly like a fresh AWS S3 bucket — no
+  bucket has a CORS policy configured out of the box, and this plugin's
+  `rustfs` init task never set one. Fixed by setting
+  `Access-Control-Allow-Origin`, `-Allow-Methods`, `-Allow-Headers`, and
+  `-Expose-Headers` in `patches/rustfs/caddyfile`, at the proxy, covering
+  every bucket through the one entry instead of a native per-bucket policy
+  — the same proxy-layer approach `azure` already used, though auditing
+  that backend (below) turned up its own, different CORS bugs in the
+  process. Re-verified live after the fix, through the same real stack:
+  the same cross-origin `fetch()` (both a simple request and one forced to
+  preflight) now succeeds, and `curl` against the Caddy-fronted host shows
+  the full `Access-Control-*` header set on both the preflight and the
+  actual `GET`. New regression test in `test_patches.py`; `EVALUATION.md`'s
+  comparison table and a new Finding 6 are corrected to match.
+
+- [Bugfix] Auditing the other two backends for the same class of bug (see
+  above) turned up two distinct, real CORS defects in the `azure` backend
+  too — found by reproducing the identical Instructor Dashboard grade-
+  report download flow against it live, through the real Caddy +
+  `rclonegw` stack:
+
+  1. **Every real GET/HEAD/PUT/etc. response carried
+     `Access-Control-Allow-Origin` *twice*.** Contrary to this Caddyfile's
+     own long-standing comment, rclone's `serve s3` already emits a
+     complete, correct set of `Access-Control-*` headers natively, no
+     `--allow-origin` flag needed — confirmed live, directly against the
+     `rclonegw` container. The Caddyfile's own unconditional
+     `header Access-Control-Allow-Origin *` then added a *second* one on
+     top, and a real browser rejects a duplicated header exactly like a
+     missing one: `the 'Access-Control-Allow-Origin' header contains
+     multiple values '*, *', but only one is allowed`. The existing live
+     conformance test never caught this: it only checked the header was
+     present via Python's `requests`, which silently joins repeated
+     response headers into one comma-separated string before the
+     assertion ever saw it, and it used OPTIONS, which (see below) never
+     carries rclone's native headers at all. Fixed by removing the
+     Caddy-level headers entirely for the non-`OPTIONS` path and trusting
+     rclone's own, already-correct output.
+  2. **A real preflight against a private bucket's presigned URL —
+     exactly what a grade report download is — failed outright with
+     `403`.** `rclonegw`'s own `OPTIONS` handling validates the SigV4
+     signature in the request regardless of method, and a presigned URL's
+     signature is computed for the one method it was minted for (`GET`
+     here), never `OPTIONS`; against the exact query string a real
+     browser preflight sends (the same URL as the real request), this
+     comes back `403 Forbidden` (`SignatureDoesNotMatch` in one
+     reproduction, a bare `403` in another). A preflight response must be
+     2xx or the browser never sends the real request at all — matching,
+     almost verbatim, the original teammate report's "doesn't pass access
+     control check" wording. The existing live conformance test only ever
+     preflighted the *public*, unauthenticated bucket, which routes to
+     `rclonegw-public` and never hits this signature check at all. Fixed
+     by answering every `OPTIONS` request directly at Caddy, before
+     either rclone gateway ever sees it.
+
+  Re-verified live after the fix: a real cross-origin `fetch()` (both a
+  simple request and one forced to preflight with a custom header) against
+  a presigned grade-report URL now succeeds; `curl` shows exactly one
+  `Access-Control-Allow-Origin` value on the real `GET` and a clean `204`
+  on the `OPTIONS` preflight; the full existing live conformance suite
+  (anonymous public/private split, generic S3 verbs, Range requests) still
+  passes unchanged. Two new live conformance tests
+  (`test_cors_allow_origin_header_is_not_duplicated`,
+  `test_cors_preflight_succeeds_on_presigned_private_bucket_url`) and one
+  offline `test_patches.py` regression test guard both fixes — confirmed
+  red against the pre-fix Caddyfile, green after, same pattern this
+  repository already uses for its other live-reproduced findings.
+
+- [Documentation] The `external_s3` backend runs no Caddy vhost at all —
+  the browser talks to the external provider directly — so neither of the
+  two fixes above can apply there. Made explicit in the README: CORS on
+  every bucket is the operator's own responsibility, the same as any other
+  access-control setting for a bucket this plugin does not provision, with
+  the exact browser-console symptoms to recognize so an operator doesn't
+  mistake their own unconfigured bucket for a plugin bug.
+
+- [Feature] Support Tutor 20.x (Teak), in addition to the already-supported
+  21.x/22.x (Ulmo/Verawood). Teak's edx-platform and course-discovery still
+  use Django's old `DEFAULT_FILE_STORAGE` string setting instead of the
+  `STORAGES` dict, so every settings patch that touches `STORAGES` now
+  branches on `"STORAGES" in globals()` rather than the Django version
+  (Teak itself runs Django 4.2.20 too, so a version check would get this
+  backwards - this is the same presence-detection idiom edx-platform's own
+  `resolve_storage_backend()` uses). Profile images get the same full S3
+  treatment as Verawood/Ulmo in both dev and production: a thin wrapper
+  storage class (referenced via a self-referential `__name__`-based path)
+  strips the `base_url` key Teak's `lms/urls.py` still needs before
+  delegating to `S3Boto3Storage`. Verified live against real Tutor 20.0.5
+  (Teak), 21.0.9 (Ulmo) and 22.0.2 (Verawood) environments: LMS, CMS and
+  Discovery boot cleanly and read/write through all three backends on every
+  version, including `tutor local launch` on Teak for the production
+  (`DEBUG=False`) code path. `pyproject.toml`'s `tutor` dependency now reads
+  `>=20.0.0,<23.0.0`.
+
 - [Bugfix] Profile images never reached object storage under `tutor dev`,
   in all three backends - two compounding bugs, both masked by `tutor
   local` never hitting the code paths that expose them. (1) Each backend

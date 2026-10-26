@@ -1,12 +1,31 @@
-STORAGES["default"]["BACKEND"] = "storages.backends.s3boto3.S3Boto3Storage"
+_s3_backend_class = "storages.backends.s3boto3.S3Boto3Storage"
+
+# Teak (Tutor 20.x) vs Verawood/Ulmo: Teak's edx-platform never defines
+# STORAGES (it's still on the old DEFAULT_FILE_STORAGE string setting) even
+# though it runs Django 4.2.20 - a django.VERSION check would get this
+# backwards, so this is presence-detection, same idiom edx-platform's own
+# resolve_storage_backend()/get_profile_image_storage() use for this exact
+# boundary. Setting both STORAGES and DEFAULT_FILE_STORAGE in one settings
+# module raises ImproperlyConfigured, confirmed live - keep this a clean if/else.
+if "STORAGES" in globals():
+    STORAGES["default"]["BACKEND"] = _s3_backend_class
+else:
+    DEFAULT_FILE_STORAGE = _s3_backend_class
+
 VIDEO_IMAGE_SETTINGS["STORAGE_KWARGS"]["location"] = VIDEO_IMAGE_SETTINGS["STORAGE_KWARGS"]["location"].lstrip("/")
 VIDEO_TRANSCRIPTS_SETTINGS["STORAGE_KWARGS"]["location"] = VIDEO_TRANSCRIPTS_SETTINGS["STORAGE_KWARGS"]["location"].lstrip("/")
 GRADES_DOWNLOAD["STORAGE_KWARGS"] = {"location": GRADES_DOWNLOAD["STORAGE_KWARGS"]["location"].lstrip("/")}
 GRADES_DOWNLOAD["STORAGE_KWARGS"]["bucket_name"] = "{{ OBJSTORAGE_GRADES_BUCKET_NAME }}"
-OPENEDX_LEARNING["MEDIA"]["BACKEND"] = STORAGES["default"]["BACKEND"]
-OPENEDX_LEARNING["MEDIA"]["OPTIONS"] = {
-    'bucket_name': "{{ OBJSTORAGE_OPENEDX_LEARNING_BUCKET_NAME }}",
-}
+
+# OPENEDX_LEARNING doesn't exist in Teak's edx-platform source at all - it
+# only works there because Tutor core's own bundled template defensively
+# pre-defines a fallback. That's an implementation detail of Tutor core, not
+# a guarantee from edx-platform, so this stays guarded rather than assumed.
+if "OPENEDX_LEARNING" in globals():
+    OPENEDX_LEARNING["MEDIA"]["BACKEND"] = _s3_backend_class
+    OPENEDX_LEARNING["MEDIA"]["OPTIONS"] = {
+        'bucket_name': "{{ OBJSTORAGE_OPENEDX_LEARNING_BUCKET_NAME }}",
+    }
 
 # Ora2 setting
 ORA2_FILEUPLOAD_BACKEND = "s3"
