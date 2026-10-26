@@ -541,6 +541,85 @@ def test_azure_init_script_has_no_bucket_policy_step() -> None:
             assert forbidden not in lowered, f"unexpected {forbidden!r} in: {line!r}"
 
 
+# --- the azure backend must not double up rclone's own CORS headers, and
+# --- must answer OPTIONS itself -----------------------------------------
+# Confirmed live, through the real Caddy + rclonegw stack: rclone's `serve
+# s3` already emits its own complete Access-Control-* headers on a real
+# GET/HEAD/PUT/etc. response. The *previous* version of this Caddyfile
+# unconditionally added its own `header Access-Control-Allow-Origin *` on
+# top, producing the header *twice* on the actual response - a real
+# browser rejects that exactly like a missing header ("contains multiple
+# values '*, *', but only one is allowed"). Separately, `rclonegw`'s own
+# OPTIONS handling is never preflight-safe: against a presigned URL's
+# exact query string (what a real browser preflight actually requests)
+# it validates the signature regardless of method and answers a bare
+# `403 Forbidden`, since a presigned URL's signature is computed for the
+# method it was minted for (GET), never OPTIONS - and a preflight
+# response must be 2xx or the browser never sends the real request. Live
+# conformance regressions: test_cors_allow_origin_header_is_not_duplicated
+# and test_cors_preflight_succeeds_on_presigned_private_bucket_url in
+# test_s3_conformance_azure.py. This is the fast, offline guard for the
+# same fix at the template level.
+def test_azure_caddyfile_does_not_duplicate_cors_headers_and_handles_options(
+    base_config: dict[str, t.Any],
+) -> None:
+    from tests.conftest import render_for_backend
+
+    cfg = render_for_backend(base_config, "azure")
+    caddy = tutor_env.Renderer(cfg).patch("caddyfile")
+
+    assert caddy.count("header Access-Control-Allow-Origin") <= 1, (
+        "rclone's `serve s3` already sends its own Access-Control-Allow-Origin "
+        "on a real GET - adding a second one here duplicates it on the "
+        "response, which a browser rejects just like a missing header"
+    )
+
+    # A bare count doesn't confirm *where* the header lives: a future edit
+    # could move it out of the OPTIONS-only @cors_preflight block and into
+    # @public_read or the default handle{} block - both of which proxy
+    # real GET/HEAD/PUT traffic to rclone - and still pass the count check
+    # above (still exactly one occurrence), the OPTIONS regex below
+    # (untouched, still present in @cors_preflight) and the respond-204
+    # regex (ditto), even though that reintroduces the exact live
+    # duplicate-header bug this test exists to catch. Pin the header to
+    # the preflight-only block, and assert it is absent everywhere else in
+    # the file, so a misplaced header fails here instead of only showing
+    # up in the live conformance test.
+    preflight_match = re.search(
+        r"handle @cors_preflight \{(.*?)\n    \}", caddy, re.DOTALL
+    )
+    assert preflight_match is not None, (
+        "expected an OPTIONS-only `handle @cors_preflight` block"
+    )
+    assert "header Access-Control-Allow-Origin" in preflight_match.group(1), (
+        "the Access-Control-Allow-Origin header must be set inside the "
+        "OPTIONS-only preflight block, not on a path that also serves "
+        "real GET/HEAD/PUT responses"
+    )
+    rest_of_caddyfile = (
+        caddy[: preflight_match.start()] + caddy[preflight_match.end() :]
+    )
+    assert "header Access-Control-Allow-Origin" not in rest_of_caddyfile, (
+        "found outside the preflight block - rclone's `serve s3` already "
+        "sends its own Access-Control-Allow-Origin on a real GET/HEAD/PUT "
+        "response proxied through @public_read or the default handle{} "
+        "block, so adding a second one there duplicates it exactly like "
+        "the live bug this test guards against"
+    )
+
+    assert re.search(r"method\s+OPTIONS", caddy), (
+        "OPTIONS must be matched and answered directly at Caddy - "
+        "rclonegw's own OPTIONS handling validates a presigned URL's "
+        "signature against the wrong method and returns a bare 403, "
+        "which fails a real preflight outright"
+    )
+    assert re.search(r"respond\s+204", caddy), (
+        "the OPTIONS short-circuit must itself answer with a clean 2xx "
+        "status - a preflight fails if its response is not 2xx, "
+        "regardless of which headers ride along with it"
+    )
+
+
 def test_rustfs_init_script_never_sets_anonymous_public() -> None:
     script = read_task_script("rustfs")
     assert "anonymous set public" not in script
@@ -581,6 +660,45 @@ def test_rustfs_console_redirect_does_not_intercept_signed_requests(
         "the matcher must exclude presigned/query-signed requests (e.g. "
         "the console's own GET /?x-id=ListBuckets)"
     )
+
+
+# --- RustFS does not send CORS headers by default ---------------------------
+# Confirmed live, through the real Caddy-fronted stack: a direct OPTIONS
+# preflight against the rustfs container (bypassing Caddy) returns a bare
+# `200 OK` with zero Access-Control-* headers, and a real cross-origin
+# browser fetch against a presigned grade-report URL - the Data
+# Download/Instructor-dashboard download flow - was blocked with "No
+# 'Access-Control-Allow-Origin' header is present on the requested
+# resource." This contradicts EVALUATION.md's original comparison table
+# ("CORS | Requires proxy-layer headers | Native default" for azure vs.
+# rustfs): RustFS can do CORS (`rc bucket cors`), but does not do it by
+# default, the same as a fresh AWS S3 bucket. Fixed the same way the
+# `azure` backend already is: headers injected at the proxy. This is the
+# regression guard for that fix, scoped to the S3 API site block only (not
+# the console block, which browsers never fetch cross-origin).
+def test_rustfs_caddyfile_sets_cors_headers_on_s3_api(
+    base_config: dict[str, t.Any],
+) -> None:
+    from tests.conftest import render_for_backend
+
+    cfg = render_for_backend(base_config, "rustfs")
+    caddy = tutor_env.Renderer(cfg).patch("caddyfile")
+
+    s3_api_block = caddy.split("# RustFS web console.")[0]
+
+    assert "Access-Control-Allow-Origin *" in s3_api_block, (
+        "no cross-origin fetch/XHR against a presigned rustfs URL (e.g. "
+        "the Instructor Dashboard's grade-report download) will ever "
+        "succeed without this - confirmed live, RustFS does not send it "
+        "by default"
+    )
+    assert re.search(r"Access-Control-Allow-Methods\s+[\"']?.*GET", s3_api_block), (
+        "needed for a *preflighted* cross-origin request (one with "
+        "custom headers) to pass - confirmed live, a direct OPTIONS "
+        "preflight against the rustfs container returns 200 with no "
+        "Access-Control-* headers at all"
+    )
+    assert "Access-Control-Allow-Headers" in s3_api_block
 
 
 # --- hook-name validity ------------------------------------------------------

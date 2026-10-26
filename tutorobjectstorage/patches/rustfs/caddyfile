@@ -1,6 +1,26 @@
 {% if OBJSTORAGE_BACKEND == "rustfs" %}
 # RustFS S3 API.
 {{ OBJSTORAGE_RUSTFS_HOST }}{$default_site_port} {
+    # CORS. Contrary to this plugin's original comparison table
+    # (EVALUATION.md: "CORS | Requires proxy-layer headers | Native
+    # default"), RustFS does not send Access-Control-* headers by
+    # default - `rc bucket cors` exists but every bucket starts with no
+    # CORS policy, the same as a fresh AWS S3 bucket. Confirmed live: a
+    # direct OPTIONS preflight against the rustfs container (bypassing
+    # Caddy) returns a bare `200 OK` with zero Access-Control-* headers,
+    # and a real cross-origin browser fetch against a presigned grade-
+    # report URL fails with "No 'Access-Control-Allow-Origin' header is
+    # present" - reproduced through the real Caddy-fronted stack, not
+    # just at the container level. Fixed by injecting headers here, at
+    # the proxy, rather than a native per-bucket RustFS CORS policy, so
+    # one place covers every bucket uniformly with no extra init-task
+    # plumbing. Allow-Methods lists every verb the S3 API uses (not just
+    # GET/HEAD) so this never has to be revisited if a future direct
+    # browser upload/delete flow needs a preflight too.
+    header Access-Control-Allow-Origin *
+    header Access-Control-Allow-Methods "GET, HEAD, PUT, POST, DELETE, OPTIONS"
+    header Access-Control-Allow-Headers *
+    header Access-Control-Expose-Headers "Content-Range,Accept-Ranges,ETag"
     import proxy "rustfs:9000"
 }
 # RustFS web console.

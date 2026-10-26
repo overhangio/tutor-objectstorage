@@ -289,7 +289,15 @@ def test_rclonegw_public_isolation_holds_even_bypassing_caddy(
 #
 # Forum images and video content are fetched directly by learner
 # browsers; video scrubbing relies on Range requests. RustFS provides
-# both for free; rclone's `serve s3` provides neither on its own.
+# Range support for free; rclone's `serve s3` does too for the byte
+# range itself (see the Range test below), though not the status code.
+# CORS is a more nuanced story than either backend provides "for free":
+# rclone's `serve s3` DOES emit a complete native Access-Control-*
+# header set on its own, unprompted - confirmed live - but it is not a
+# complete solution on its own, see Finding 7 in EVALUATION.md for what
+# was actually wrong (a doubled header, and a 403 on a preflight against
+# a private bucket's presigned URL) and how this plugin's Caddyfile
+# fixes it without relying on rclone's native behavior alone.
 
 
 def test_cors_header_present_on_public_bucket(public_host: str, bucket: str) -> None:
@@ -303,6 +311,86 @@ def test_cors_header_present_on_public_bucket(public_host: str, bucket: str) -> 
         "no Access-Control-Allow-Origin header; direct browser fetch/XHR "
         "against this host (not just <img> tags) will be silently blocked"
     )
+
+
+# Confirmed live: rclone's `serve s3` already sends its own complete
+# Access-Control-* headers on a real GET - this Caddyfile must not also
+# inject one, or the response carries the header *twice*. A real browser
+# rejects that just as hard as a missing header ("contains multiple
+# values '*, *', but only one is allowed"), but `requests`/urllib3 joins
+# repeated response headers with ", " before this test ever sees them, so
+# the test above (a bare truthiness check) cannot tell "*" from "*, *".
+# This is the regression guard for that distinct failure mode - and it
+# must use GET, not OPTIONS: confirmed live, rclone's own OPTIONS
+# handling never emits its own Access-Control-* headers at all (a bare
+# `400 Bad Request` with none), so only GET/HEAD/PUT/etc. actually
+# exercise the duplication; an OPTIONS-based version of this test passed
+# even against the original, duplicating Caddyfile.
+def test_cors_allow_origin_header_is_not_duplicated(
+    s3: t.Any, public_host: str, bucket: str, key: str
+) -> None:
+    requests = pytest.importorskip("requests")
+    s3.put_object(Bucket=bucket, Key=key, Body=b"cors-dup-check")
+    response = requests.get(
+        f"{public_host}/{bucket}/{key}",
+        headers={"Origin": "https://example.com"},
+        timeout=30,
+    )
+    value = response.headers.get("Access-Control-Allow-Origin", "")
+    assert value == "*", (
+        f"expected exactly one Access-Control-Allow-Origin value, got "
+        f"{value!r} - a real browser rejects a duplicated header exactly "
+        f"like a missing one"
+    )
+
+
+# Confirmed live: a real CORS *preflight* (OPTIONS with
+# Access-Control-Request-Method) against a presigned URL for the
+# *private* bucket - the kind a grade report or any authenticated
+# download actually uses, unlike the public-bucket checks above - got a
+# bare `403 Forbidden` from the authenticated gateway, because a
+# presigned URL's signature is computed for the one method it was minted
+# for (GET) and the gateway validated that same signature against the
+# OPTIONS method it actually received. A preflight response must be 2xx
+# or the browser fails the whole request before ever sending the real
+# one. This is the regression guard for that failure mode specifically -
+# the public-bucket CORS tests above route to the unauthenticated gateway
+# and would never have caught this.
+def test_cors_preflight_succeeds_on_presigned_private_bucket_url(
+    s3: t.Any, public_host: str, private_bucket: str
+) -> None:
+    requests = pytest.importorskip("requests")
+    name = f"tutor-objectstorage-azure-test/{uuid.uuid4()}.csv"
+    s3.put_object(Bucket=private_bucket, Key=name, Body=b"grade,report")
+    try:
+        url = s3.generate_presigned_url(
+            "get_object",
+            Params={"Bucket": private_bucket, "Key": name},
+            ExpiresIn=300,
+        )
+        response = requests.options(
+            url,
+            headers={
+                "Origin": "https://example.com",
+                "Access-Control-Request-Method": "GET",
+                "Access-Control-Request-Headers": "x-requested-with",
+            },
+            timeout=30,
+        )
+        assert response.ok, (
+            f"preflight against a presigned private-bucket URL returned "
+            f"{response.status_code}, not 2xx - a browser fails the whole "
+            f"request before the real GET is ever sent: {response.text[:400]}"
+        )
+        assert response.headers.get("Access-Control-Allow-Origin"), (
+            "preflight response is 2xx but carries no "
+            "Access-Control-Allow-Origin header"
+        )
+    finally:
+        try:
+            s3.delete_object(Bucket=private_bucket, Key=name)
+        except Exception:  # noqa: BLE001 - cleanup must not mask failures
+            pass
 
 
 def test_range_request_returns_partial_content(

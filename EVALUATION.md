@@ -37,12 +37,15 @@ was confirmed by reading rclone's own source, not inferred from symptoms
 alone.
 
 Everything else about this backend — the two-process anonymous/private
-bucket split, the Kubernetes network isolation, CORS, concurrency, the
-generic S3 verbs — worked correctly once built, including surviving an
-adversarial design review before a line of code was written, and including a
-full live re-verification through the real Caddy container when this backend
-was folded into this unified plugin. That makes Finding 1 more significant,
-not less: this is a careful implementation of the idea, and the idea still
+bucket split, the Kubernetes network isolation, concurrency, the generic S3
+verbs — worked correctly once built, including surviving an adversarial
+design review before a line of code was written, and including a full live
+re-verification through the real Caddy container when this backend was
+folded into this unified plugin. CORS is the one exception: it did *not*
+work correctly once built, in two distinct ways not caught until a later
+audit — see [Finding 7](#finding-7-two-distinct-cors-bugs-in-the-caddy-level-fix-fixed),
+now fixed. That makes Finding 1 more significant, not less: this is a
+careful implementation of the idea, and the idea still
 breaks on contact with a real multipart upload pattern.
 
 ## What this document is
@@ -122,10 +125,11 @@ folded into the unified `tutor-objectstorage` plugin:
     ingress from the Caddy pod only (closing the exposure that the `rustfs`
     backend's own `NodePort`-without-restriction pattern would have created
     here) renders correctly and was validated statically.
-- **CORS** works, because this backend deliberately does not rely on
-  rclone's own `--allow-origin` flag (whose documentation ties it to
-  rclone's WebDAV/remote-control code path, with no confirmation it covers
-  `serve s3` at all) and sets the headers at the Caddy layer instead.
+- **CORS now works**, correctly, on both a real GET/HEAD/PUT/etc. response
+  and a real preflight against a private bucket's presigned URL. This was
+  not true when this document first shipped — see
+  [Finding 7](#finding-7-two-distinct-cors-bugs-in-the-caddy-level-fix-fixed)
+  for what was actually wrong and how it was fixed.
 - **Concurrent-GET latency does not scale with client count** — the
   regression guard for a real, previously-shipped rclone bug (a lock held for
   an entire HTTP transaction, serializing every other client, fixed in
@@ -316,8 +320,16 @@ backend never has to:
 
 1. **No bucket ACLs** → a second gateway process plus Caddy routing (see
    "What works" above) instead of one `rc anonymous set download` command.
-2. **No native CORS** → headers set at the proxy layer instead of a server
-   default.
+2. **A broken native preflight (`OPTIONS`) path** → rclone's `serve s3`
+   already sends a complete, native set of `Access-Control-*` headers on
+   every real `GET`/`HEAD`/`PUT`/etc. response, but its own `OPTIONS`
+   handling enforces SigV4 validation that rejects presigned-URL
+   preflights, so Caddy has to intercept `OPTIONS` itself to make CORS
+   work at all; see
+   [Finding 7](#finding-7-two-distinct-cors-bugs-in-the-caddy-level-fix-fixed).
+   (`rustfs` isn't CORS-free either — it ships with no header set by
+   default and needed the same proxy-layer fix, for a different reason;
+   see [Finding 6](#finding-6-the-rustfs-backend-does-not-send-cors-headers-by-default-fixed).)
 3. **No "this bucket must stay private" network boundary** → a Kubernetes
    `NetworkPolicy` this backend has to ship and the `rustfs` backend doesn't
    need.
@@ -467,6 +479,116 @@ storage path (a SCORM package is the easiest way to get one).
   bug (resource contention in the serve-s3 layer) clearly isn't extinct,
   given Finding 1.
 
+### Finding 6: the `rustfs` backend does not send CORS headers by default (fixed)
+
+This document's own comparison table (below) originally claimed CORS was a
+"Native default" for the `rustfs` backend, needing no proxy-layer work the
+way `azure`'s `rclonegw` does. That claim was wrong, and it mattered: it is
+the reason the `rustfs` Caddyfile patch shipped with no
+`Access-Control-Allow-Origin` handling at all, while the `azure` one has had
+it since this plugin's initial release.
+
+**Confirmed live**, through the real Caddy-fronted stack (`tutor local
+launch`, Tutor 21.0.9/Ulmo): a course's Instructor Dashboard → Data
+Download → "Generate Grade Report" produces a presigned download URL on the
+`files.<LMS_HOST>` host; a genuine cross-origin browser `fetch()`/XHR
+against that URL — the kind any JS-driven download flow does, not a plain
+`<a>` navigation — fails with:
+
+```
+Access to fetch at 'http://files.../openedxgrades/.../grade_report....csv?X-Amz-...'
+from origin 'http://...' has been blocked by CORS policy: No
+'Access-Control-Allow-Origin' header is present on the requested resource.
+```
+
+Root cause, isolated at the container level: a direct `OPTIONS` preflight
+against the `rustfs` container itself (bypassing Caddy entirely) returns a
+bare `200 OK` with **zero** `Access-Control-*` response headers. RustFS does
+have a native CORS mechanism — `rc bucket cors set` — but, exactly like a
+fresh AWS S3 bucket, every bucket starts with no CORS policy configured.
+Nothing in this plugin's `rustfs` init task ever set one.
+
+**Fixed**: `Access-Control-Allow-Origin`, `-Allow-Methods`, `-Allow-Headers`,
+and `-Expose-Headers` are now set at the Caddy layer, in
+`patches/rustfs/caddyfile`, covering every bucket uniformly through the one
+proxy entry rather than needing a native CORS policy set per bucket.
+Re-verified live after the fix: the same cross-origin `fetch()` (both a
+simple request and one forced to preflight with a custom header) now
+succeeds, and a direct `curl` against the Caddy-fronted host shows the full
+set of `Access-Control-*` headers on both the `OPTIONS` preflight response
+and the actual `GET`. This is the same proxy-layer *approach* `azure`
+already used — but auditing `azure` for the same class of bug, below,
+found its existing implementation of that approach was itself broken in
+two different ways.
+
+### Finding 7: two distinct CORS bugs in the Caddy-level fix (fixed)
+
+Auditing every backend for the `rustfs` CORS gap above (Finding 6) by
+reproducing the identical Instructor Dashboard grade-report download
+against `azure` live — not just re-reading this Caddyfile — turned up two
+real, independent defects in a piece of this plugin's Caddy configuration
+that had shipped since its initial release and was, until this pass,
+believed to be correct.
+
+**Bug 1: every real response carried `Access-Control-Allow-Origin` twice.**
+This document's own "What works" section above used to state that CORS
+here depended on *not* using rclone's `--allow-origin` flag and instead
+setting headers at the Caddy layer, because rclone's own CORS support was
+unconfirmed. Confirmed live, directly against the `rclonegw` container,
+bypassing Caddy: that assumption was backwards. rclone's `serve s3` already
+sends a complete, correct set of `Access-Control-*` headers on its own,
+unconditionally, for a real `GET`/`HEAD`/`PUT`/etc. response — full
+`Allow-Methods`, a detailed `Allow-Headers` list, and `Access-Control-Allow-
+Origin: *`. Caddy's own `header Access-Control-Allow-Origin *` then added a
+*second* copy on top. A real browser treats two conflicting values exactly
+like zero: `the 'Access-Control-Allow-Origin' header contains multiple
+values '*, *', but only one is allowed`. This was never caught by the
+existing live conformance test (`test_cors_header_present_on_public_bucket`)
+because it used Python's `requests`, whose `CaseInsensitiveDict` silently
+joins repeated response headers into one comma-separated string before any
+assertion sees them, and because it used `OPTIONS` — which, per Bug 2
+below, never carries rclone's native headers at all, so no duplication was
+ever visible through that code path.
+
+**Bug 2: a real preflight against a private bucket's presigned URL failed
+outright with `403`.** The grade-report download flow serves a presigned
+URL for the *private* `openedxgrades` bucket, routed through the
+*authenticated* `rclonegw` process (not `rclonegw-public`). Confirmed live:
+`rclonegw`'s own `OPTIONS` handling validates the SigV4 signature in the
+request regardless of HTTP method. A presigned URL's signature is computed
+for the one method it was minted for — `GET`, always, for a download link
+— and is never valid for `OPTIONS`. Sent to the exact URL a real browser
+preflight actually requests (the Fetch spec preflights the same
+request-target as the real request, query string included), this comes
+back `403 Forbidden` — `SignatureDoesNotMatch` in one reproduction, a bare
+`403` with no body in another, depending on exactly what accompanied it.
+A CORS preflight response must be a 2xx status or the browser abandons the
+whole request before ever sending the real one — independent of which
+`Access-Control-*` headers ride along with that 403. This also went
+uncaught, because the existing live conformance test only ever preflighted
+the *public* bucket, which routes to the unauthenticated `rclonegw-public`
+and never reaches this signature check at all; nothing in the original test
+suite preflighted a private-bucket presigned URL.
+
+**Fixed**: `patches/azure/caddyfile` now short-circuits every `OPTIONS`
+request directly at Caddy — before either rclone gateway ever sees one —
+answering with a clean `204` and its own full `Access-Control-*` header
+set, and no longer adds its own headers to the non-`OPTIONS` path at all,
+trusting rclone's own, already-correct native output instead. Re-verified
+live after the fix: a real cross-origin `fetch()` (both a simple request
+and one forced to preflight with a custom header) against a presigned
+grade-report URL now succeeds; `curl` shows exactly one
+`Access-Control-Allow-Origin` value on the real `GET` and a clean `204` on
+the `OPTIONS` preflight; the full pre-existing live conformance suite —
+the anonymous public/private split, every generic S3 verb, Range
+requests — still passes unchanged, confirming the restructured Caddy
+routing didn't regress anything it didn't touch. Two new live tests
+(`test_cors_allow_origin_header_is_not_duplicated`,
+`test_cors_preflight_succeeds_on_presigned_private_bucket_url`) and one
+offline `test_patches.py` check guard both bugs specifically — each
+confirmed red against the pre-fix Caddyfile and green after, the same
+red/green discipline Finding 5's fix used.
+
 ## azure backend vs. rustfs backend
 
 | | `azure` backend | `rustfs` backend |
@@ -477,7 +599,7 @@ storage path (a SCORM package is the easiest way to get one).
 | Multipart upload (out-of-order parts) | Narrowed, not eliminated: hangs past `OBJSTORAGE_AZURE_MULTIPART_BUFFER_LIMIT` (default 2GiB, was rclone's 256MiB); see Finding 1 | No equivalent risk — no translation layer |
 | Listing an empty prefix (`listdir`/`ListObjectsV2` + `Delimiter`) | Fixed (`--dir-cache-time=10ms`); see Finding 5 | No equivalent risk — no translation layer |
 | Bucket-level anonymous read | Requires a second process + proxy routing | One native command |
-| CORS | Requires proxy-layer headers | Native default |
+| CORS | Real GET/HEAD/PUT response is native (rclone's own headers); only the OPTIONS preflight is answered at the proxy layer — see Finding 7 | Can do it natively (`rc bucket cors`), but does not by default — this plugin fixes it at the proxy layer for every request, preflight and real response alike; see Finding 6 |
 | Local disk / non-root chown dance | None — stateless, no local volume | Required on fresh Linux installs |
 | Kubernetes PVC | None needed | Required |
 | Web console | None (use Azure Portal/Storage Explorer) | Built in |

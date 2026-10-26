@@ -16,11 +16,46 @@
 # compression are hoisted to the site level instead, applying to both
 # backends uniformly rather than duplicated per branch.
 #
-# CORS is set here, at the proxy, rather than via rclone's own
-# --allow-origin flag: that flag's documentation ties it to rclone's
-# WebDAV/remote-control code path with no confirmation it applies to the
-# `serve s3` handler chain at all. A Caddy header directive is certain to
-# work regardless.
+# CORS. Confirmed live, against the real rclonegw container: rclone's
+# `serve s3` already sends a complete, correct set of Access-Control-*
+# headers on its own for an actual GET/HEAD/PUT/etc. response - no
+# `--allow-origin` flag needed, contrary to what an earlier version of
+# this comment assumed. Caddy's own `header` directive, at the site or
+# `handle` level, must NOT also inject a copy of any header rclone
+# already sets: it does not replace what `reverse_proxy` later copies
+# from the upstream response, it adds a second value - a real browser
+# rejects a GET with two "Access-Control-Allow-Origin: *" lines just as
+# hard as it rejects a response with none ("contains multiple values
+# '*, *', but only one is allowed" - confirmed live, this used to be
+# exactly what this Caddyfile produced). This is why Allow-Origin/
+# -Methods/-Headers are set only inside the OPTIONS-only handle block
+# below, never at the site level where they'd collide with rclone's own
+# output on a real GET/HEAD/PUT.
+#
+# Access-Control-Expose-Headers is a narrower case of the same trap:
+# rclone's own native value is just "ETag" (confirmed live), not the
+# "Content-Range,Accept-Ranges,ETag" this backend's Range-request/video-
+# scrubbing support needs exposed to JS. A site-level `header` can't fix
+# this either - same duplication mechanism - so each `reverse_proxy`
+# block below uses `header_down`, which operates on the upstream
+# response rclone already wrote and genuinely replaces it (confirmed
+# live: `header_down -Field` immediately followed by `header_down Field
+# value` left the header missing entirely - a real Caddy quirk, not a
+# theory - whereas a bare `header_down Field value` on its own replaces
+# cleanly, exactly once).
+#
+# OPTIONS is a different, separate problem: confirmed live, `rclonegw`'s
+# own OPTIONS handling is never preflight-safe. Against the bare path
+# (no query string) it answers a plain `400 Bad Request`; against a
+# presigned URL's exact query string - what a real browser preflight
+# actually requests, since the preflight target matches the real
+# request's URL - it answers `403 Forbidden`, because a presigned URL's
+# signature is computed for the one method it was minted for (GET here)
+# and `rclonegw` validates that signature regardless of method. A
+# preflight response must be 2xx or the browser fails the whole request
+# before ever sending the real one ("doesn't pass access control check:
+# It does not have HTTP ok status"). Fixed by answering every OPTIONS
+# request directly at Caddy, before either rclone gateway ever sees it.
 #
 # The discovery-bucket clause in the path matcher is conditional on
 # purpose. OBJSTORAGE_DISCOVERY_BUCKET_NAME renders to an empty string when
@@ -44,8 +79,16 @@
     }
     encode gzip
 
-    header Access-Control-Allow-Origin *
-    header Access-Control-Expose-Headers "Content-Range,Accept-Ranges,ETag"
+    @cors_preflight {
+        method OPTIONS
+    }
+    handle @cors_preflight {
+        header Access-Control-Allow-Origin *
+        header Access-Control-Allow-Methods "GET, HEAD, PUT, POST, DELETE, OPTIONS"
+        header Access-Control-Allow-Headers *
+        header Access-Control-Max-Age 86400
+        respond 204
+    }
 
     @public_read {
         method GET HEAD
@@ -54,11 +97,13 @@
     handle @public_read {
         reverse_proxy rclonegw-public:9000 {
             header_up X-Forwarded-Port 80
+            header_down Access-Control-Expose-Headers "Content-Range,Accept-Ranges,ETag"
         }
     }
     handle {
         reverse_proxy rclonegw:9000 {
             header_up X-Forwarded-Port 80
+            header_down Access-Control-Expose-Headers "Content-Range,Accept-Ranges,ETag"
         }
     }
 }

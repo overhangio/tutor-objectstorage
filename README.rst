@@ -197,6 +197,20 @@ have genuinely different ACL/CLI semantics, so, matching how
 bucket listed above yourself before enabling this plugin. ``tutor local do
 init`` will print exactly which bucket names it expects.
 
+**CORS is also your responsibility, specifically.** This backend has no
+Caddy vhost of its own — the browser downloads a grade report, a course
+export, or any other private-bucket object directly from your provider,
+not through anything this plugin runs. If a JS-driven cross-origin
+download (not a plain link click, which isn't subject to CORS) fails in
+the browser console with something like "No 'Access-Control-Allow-Origin'
+header is present" or "Response to preflight request doesn't pass access
+control check", that is your bucket's own CORS configuration, not a bug
+in this plugin — set a CORS policy on every bucket listed above via your
+provider's own tooling (e.g. ``aws s3api put-bucket-cors`` for real AWS
+S3) that allows your Open edX host(s) as an origin. The ``rustfs`` and
+``azure`` backends both set this up for you automatically, because this
+plugin controls their infrastructure; it cannot do the same here.
+
 DNS records
 -----------
 
