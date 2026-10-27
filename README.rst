@@ -19,8 +19,11 @@ three backends actually runs:
      - ``external_s3``
 
 This plugin supersedes two previous, separately-released plugins,
-``tutor-rustfs`` and ``tutor-rclone-gateway`` — see `MIGRATING.rst
-<MIGRATING.rst>`_ if you're coming from either of those. It is **not**
+``tutor-rustfs`` and ``tutor-rclone-gateway``, and its ``rustfs`` backend is
+the successor to the archived ``tutor-minio`` — see `MIGRATING.rst
+<MIGRATING.rst>`_ if you're coming from any of those (``tutor-minio`` is the
+most common case, and the only one of the three that's a real data
+migration rather than a config rename). It is **not**
 affiliated with `tutor-contrib-s3 <https://github.com/cleura/tutor-contrib-s3>`_,
 an independently maintained plugin; the ``external_s3`` backend here
 reimplements equivalent functionality so this plugin can be a complete,
