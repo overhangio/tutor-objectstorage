@@ -1,7 +1,7 @@
 Migrating to tutor-objectstorage
 =================================
 
-``tutor-objectstorage`` can replace three different plugins. Which recipe
+``tutor-objectstorage`` can replace two different plugins. Which recipe
 below applies depends on which one you're running:
 
 - **From tutor-minio** (the most common case — this was the plugin bundled
@@ -13,11 +13,10 @@ below applies depends on which one you're running:
   documented or supported way to point RustFS at a MinIO data directory and
   have it read the existing objects, so every object has to actually move,
   bucket by bucket, over the S3 API itself — see `From tutor-minio`_ below.
-- **From tutor-rustfs or tutor-rclone-gateway** (this plugin's own direct
-  predecessors): both predecessors' service names, bind-mount paths, and PVC
-  names are kept **identical** in this plugin, so migrating is a config-key
-  rename, not a data migration: no new volume, no new chown dance, no
-  re-upload.
+- **From tutor-rustfs** (this plugin's own direct predecessor): its service
+  names, bind-mount path, and PVC name are kept **identical** in this
+  plugin, so migrating is a config-key rename, not a data migration: no new
+  volume, no new chown dance, no re-upload.
 
 Tutor itself has no built-in mechanism for renaming a plugin's own config
 keys (confirmed by reading ``tutor/config.py``: the only rename support is a
@@ -70,12 +69,12 @@ MinIO is running as a real local server with its own bind-mounted volume,
 not MinIO's old (and now-removed-upstream) "gateway" mode in front of a
 real S3 or Azure account. If you *are* running gateway mode, your objects
 already live in that external account, not in MinIO's volume — skip the
-dump/restore steps below, go straight to the `From tutor-rclone-gateway`_
-section if your gateway target was Azure, or the ``external_s3`` config in
-the README if it was S3-compatible, and treat it as a rename against that
-same external account. Tutor-minio never actually surfaced the gateway
-target's credentials as its own config keys, so that path was already a
-manual, undocumented override before this plugin existed.
+dump/restore steps below and configure that backend directly instead: the
+``azure`` backend config in the README if your gateway target was Azure, or
+the ``external_s3`` config if it was S3-compatible, pointed at that same
+external account. Tutor-minio never actually surfaced the gateway target's
+credentials as its own config keys, so that path was already a manual,
+undocumented override before this plugin existed.
 
 ::
 
@@ -272,81 +271,6 @@ From ``tutor-rustfs``
 ``RUSTFS_DISCOVERY_BUCKET_NAME`` has no separate step: it's computed from
 whether the ``discovery`` plugin is enabled, exactly as before, just now
 under the shared ``OBJSTORAGE_DISCOVERY_BUCKET_NAME`` name.
-
-From ``tutor-rclone-gateway``
--------------------------------
-
-Same shape as above, with one new, mandatory step this plugin didn't have
-before: you must explicitly accept the known multipart-upload risk (see
-``EVALUATION.md``) as a second, separate setting. This migration is
-lower-risk on the data side than the ``rustfs`` migration above — all
-object data lives in Azure itself, not a local volume, so there's no
-"reuse the same volume" concern at all; only the init job's own identity
-changes (see below), and that job is stateless and disposable.
-
-::
-
-    # 1. Capture the old plugin's values first.
-    tutor config printvalue RCLONEGW_BUCKET_NAME
-    tutor config printvalue RCLONEGW_FILE_UPLOAD_BUCKET_NAME
-    tutor config printvalue RCLONEGW_VIDEO_UPLOAD_BUCKET_NAME
-    tutor config printvalue RCLONEGW_GRADES_BUCKET_NAME
-    tutor config printvalue RCLONEGW_OPENEDX_LEARNING_BUCKET_NAME
-    tutor config printvalue RCLONEGW_QUERYSTRING_AUTH
-    tutor config printvalue RCLONEGW_HOST
-    tutor config printvalue RCLONEGW_REGION
-    tutor config printvalue RCLONEGW_DOCKER_IMAGE
-    tutor config printvalue RCLONEGW_UID
-    tutor config printvalue RCLONEGW_GID
-    tutor config printvalue RCLONEGW_AZURE_ACCOUNT
-    tutor config printvalue RCLONEGW_AZURE_ACCOUNT_KEY
-    tutor config printvalue RCLONEGW_AZURE_ENDPOINT
-    tutor config printvalue RCLONEGW_AZURITE_DOCKER_IMAGE
-    tutor config printvalue RCLONEGW_AWS_SECRET_ACCESS_KEY
-
-    # 2. Swap the plugin.
-    pip install tutor-objectstorage
-    tutor plugins disable rclonegateway
-    tutor plugins enable objectstorage
-    pip uninstall tutor-rclone-gateway   # optional, once confirmed working
-
-    # 3. Re-apply the captured values, PLUS the new mandatory risk
-    #    acknowledgment. Use your own printed values, not these examples.
-    tutor config save \
-        --set OBJSTORAGE_BACKEND=azure \
-        --set OBJSTORAGE_AZURE_ACKNOWLEDGE_RISK=true \
-        --set OBJSTORAGE_BUCKET_NAME=openedx \
-        --set OBJSTORAGE_FILE_UPLOAD_BUCKET_NAME=openedxuploads \
-        --set OBJSTORAGE_VIDEO_UPLOAD_BUCKET_NAME=openedxvideos \
-        --set OBJSTORAGE_GRADES_BUCKET_NAME=openedxgrades \
-        --set OBJSTORAGE_OPENEDX_LEARNING_BUCKET_NAME=openedxlearning \
-        --set OBJSTORAGE_QUERYSTRING_AUTH=true \
-        --set OBJSTORAGE_AZURE_HOST=files.example.com \
-        --set OBJSTORAGE_AZURE_REGION=us-east-1 \
-        --set OBJSTORAGE_AZURE_DOCKER_IMAGE=docker.io/rclone/rclone:1.75.1 \
-        --set OBJSTORAGE_AZURE_UID=1009 \
-        --set OBJSTORAGE_AZURE_GID=1009 \
-        --set OBJSTORAGE_AZURE_ACCOUNT=<your captured value> \
-        --set OBJSTORAGE_AZURE_ACCOUNT_KEY=<your captured value> \
-        --set OBJSTORAGE_AZURE_ENDPOINT=<your captured value> \
-        --set OBJSTORAGE_AZURITE_DOCKER_IMAGE=mcr.microsoft.com/azure-storage/azurite:3.37.0 \
-        --set OBJSTORAGE_AWS_SECRET_ACCESS_KEY=<your captured RCLONEGW_AWS_SECRET_ACCESS_KEY> \
-        --set OPENEDX_AWS_SECRET_ACCESS_KEY=<your captured RCLONEGW_AWS_SECRET_ACCESS_KEY>
-
-    # 4. Confirm the secret matches — see the warning above if this doesn't
-    #    match: it means the OPENEDX_ key above was missed, not that
-    #    something else is wrong. Then launch.
-    tutor config printvalue OPENEDX_AWS_SECRET_ACCESS_KEY
-    tutor local launch
-
-**What changes under the hood, harmlessly**: the init job's service name
-moves from ``rclonegw-job`` to ``objectstorage-job`` (this plugin's init
-task is now registered under the same name as the plugin itself, for every
-backend — see the Unreleased changelog entry for why). Since that job only
-runs ``rclone mkdir`` against Azure and holds no state of its own, this
-rename has no data consequence; it just means ``tutor local do init
---limit=`` now takes the plugin name ``objectstorage``, not
-``rclonegateway``.
 
 From ``tutor-contrib-s3`` (optional — not a required migration)
 -------------------------------------------------------------------

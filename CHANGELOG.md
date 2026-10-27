@@ -7,20 +7,25 @@
 - [Documentation] `MIGRATING.rst` now covers moving from `tutor-minio`
   (previously undocumented, and the most common starting point for existing
   deployments — it was bundled with Tutor's own binary releases for years).
-  Unlike the `tutor-rustfs`/`tutor-rclone-gateway` sections, this one is a
-  real data migration, not a config rename: RustFS is a from-scratch
-  reimplementation of the S3 API, not a MinIO fork, with no guaranteed
-  on-disk compatibility and a different bind-mount path
-  (`data/rustfs` vs. `data/minio`), so every object has to move over the S3
-  API itself. Verified end-to-end by hand against a throwaway deployment —
-  real buckets populated with file types resembling actual Open edX usage
-  (a course asset, a profile image, a video upload, a grades export, a
-  learning-core block), migrated through the documented recipe, with every
-  object's SHA-1 checksum confirmed identical before and after.
+  Unlike the `tutor-rustfs` section, this one is a real data migration, not
+  a config rename: RustFS is a from-scratch reimplementation of the S3 API,
+  not a MinIO fork, with no guaranteed on-disk compatibility and a
+  different bind-mount path (`data/rustfs` vs. `data/minio`), so every
+  object has to move over the S3 API itself. Verified end-to-end by hand
+  against a throwaway deployment — real buckets populated with file types
+  resembling actual Open edX usage (a course asset, a profile image, a
+  video upload, a grades export, a learning-core block), migrated through
+  the documented recipe, with every object's SHA-1 checksum confirmed
+  identical before and after.
 
-  Testing this surfaced a real bug in the two existing predecessor
-  sections, now fixed in both: `--set OBJSTORAGE_AWS_SECRET_ACCESS_KEY=<old
-  secret>` alone does not actually carry the secret over.
+  Also removed the `tutor-rclone-gateway` migration section added earlier
+  in this same Unreleased entry: that plugin was never actually published
+  (it only ever existed on a personal fork), so there was never a real
+  deployment anyone could be migrating from it.
+
+  Testing surfaced a real bug in the `tutor-rustfs` predecessor section,
+  now fixed: `--set OBJSTORAGE_AWS_SECRET_ACCESS_KEY=<old secret>` alone
+  does not actually carry the secret over.
   `OPENEDX_AWS_SECRET_ACCESS_KEY` (the value Django/boto3 actually read) is
   a `CONFIG_OVERRIDES` entry rendered once, at `tutor plugins enable
   objectstorage` time, against whatever `OBJSTORAGE_AWS_SECRET_ACCESS_KEY`
@@ -29,7 +34,7 @@
   OBJSTORAGE_AWS_SECRET_ACCESS_KEY=...` never reaches that frozen literal.
   Confirmed live: following the previously-documented steps left
   `OPENEDX_AWS_SECRET_ACCESS_KEY` holding the new random secret, not the
-  migrated one. All three recipes now also `--set
+  migrated one. Both recipes now also `--set
   OPENEDX_AWS_SECRET_ACCESS_KEY=<old secret>` explicitly, which does fix it.
 
 - [Bugfix] The `rustfs` backend never sent CORS headers, breaking any

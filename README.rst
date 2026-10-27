@@ -18,12 +18,12 @@ three backends actually runs:
        provider (including a RustFS/MinIO instance on a separate machine)
      - ``external_s3``
 
-This plugin supersedes two previous, separately-released plugins,
-``tutor-rustfs`` and ``tutor-rclone-gateway``, and its ``rustfs`` backend is
-the successor to the archived ``tutor-minio`` — see `MIGRATING.rst
-<MIGRATING.rst>`_ if you're coming from any of those (``tutor-minio`` is the
-most common case, and the only one of the three that's a real data
-migration rather than a config rename). It is **not**
+This plugin supersedes the previous, separately-released ``tutor-rustfs``
+plugin, and its ``rustfs`` backend is the successor to the archived
+``tutor-minio`` — see `MIGRATING.rst <MIGRATING.rst>`_ if you're coming from
+either of those (``tutor-minio`` is the most common case, and the only one
+of the two that's a real data migration rather than a config rename). It is
+**not**
 affiliated with `tutor-contrib-s3 <https://github.com/cleura/tutor-contrib-s3>`_,
 an independently maintained plugin; the ``external_s3`` backend here
 reimplements equivalent functionality so this plugin can be a complete,
@@ -70,10 +70,11 @@ behind that endpoint differs entirely by backend:
 
 Selecting a backend you aren't using costs nothing: that backend's
 compose/Kubernetes resources, Caddy routing, and init-task logic simply don't
-render. Enabling more than one object-storage plugin (``tutor-minio``, or this
-plugin's own predecessors ``tutor-rustfs``/``tutor-rclone-gateway``, or
-``tutor-contrib-s3``) raises an error, since they'd collide on the same Open
-edX settings.
+render. Enabling more than one object-storage plugin (``tutor-minio``, this
+plugin's own predecessor ``tutor-rustfs``, a plugin registered as
+``rclonegateway`` (an unpublished fork this plugin's ``azure`` backend
+originated from), or ``tutor-contrib-s3``) raises an error, since they'd
+collide on the same Open edX settings.
 
 Installation
 ------------
