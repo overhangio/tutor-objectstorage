@@ -11,7 +11,7 @@ authors = [
 description = "A Tutor plugin for Open edX object storage: RustFS, Azure Blob Storage (via rclone), or any external S3-compatible provider, picked with one config key"
 readme = {file = "README.rst", content-type = "text/x-rst"}
 maintainers = [
-    { name = "Syed Ali Abbas" }, { email = "ali.abbas02@arbisoft.com" }
+    { name = "Umair Naveed" }, { email = "umair.naveed@arbisoft.com" }
 ]
 classifiers = [
     "Development Status :: 4 - Beta",
