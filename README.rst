@@ -254,7 +254,7 @@ This work is licensed under the terms of the `GNU Affero General Public License
 Maintained by
 --------------
 
-This Tutor plugin is maintained by Syed Ali Abbas from
+This Tutor plugin is maintained by Umair Naveed from
 `Edly <https://edly.io>`__. Community support is available from the official
 `Open edX forum <https://discuss.openedx.org>`__. Do you need help with this
 plugin? See the `troubleshooting
