@@ -1,8 +1,9 @@
 {% if OBJSTORAGE_BACKEND == "azure" and OBJSTORAGE_AZURE_ACKNOWLEDGE_RISK %}
 ---
 # ClusterIP, not NodePort: neither gateway needs to be reachable from
-# outside the cluster, only from the Caddy pod (see the k8s-override
-# NetworkPolicy). tutor-rustfs's storage Service uses NodePort because
+# outside the cluster, only from the Caddy pod (enforced by the
+# NetworkPolicies at the end of this patch). tutor-rustfs's storage
+# Service uses NodePort because
 # RustFS has no "this bucket is public, this one isn't" distinction to
 # protect in the first place; this backend does, so it deliberately
 # doesn't inherit that pattern.
@@ -44,4 +45,73 @@ spec:
       name: blob
   selector:
     app.kubernetes.io/name: azurite
+---
+# NetworkPolicies restricting both gateway Deployments to ingress from the
+# Caddy pod only. These deliberately live in the k8s-services patch (which
+# Tutor core appends to k8s/services.yml, a file listed under kustomize's
+# `resources:`) rather than the k8s-override patch. k8s-override is wired
+# into kustomize's `patches:` list, i.e. strategic-merge patches, which can
+# only modify a resource that already exists in the base - they cannot
+# introduce a brand-new standalone resource like a NetworkPolicy. Putting
+# these there makes `tutor k8s start` fail at kustomize build with
+# "no resource matches strategic merge patch NetworkPolicy ... rclonegw".
+# A NetworkPolicy is not a Service, but kustomize/kubectl apply a multi-doc
+# manifest by kind regardless of filename, so co-locating them here (the
+# resources file closest in intent - both are about reaching these pods) is
+# valid and keeps all of this backend's network exposure in one place.
+#
+# No rustfs-backend equivalent: RustFS has no bucket whose security depends
+# on only being reachable through Caddy. Both gateway Deployments do -
+# rclonegw-public's --include/--read-only scoping (see
+# local-docker-compose-services) is meant to be the *last* line of defense,
+# not the only one, and ClusterIP alone (the Services above) still leaves
+# both Deployments reachable from any other pod in the cluster via Service
+# DNS. Restrict ingress to the Caddy pod specifically.
+#
+# NOTE: NetworkPolicy is only *enforced* by a CNI that implements it
+# (Calico, Cilium, AKS with a network policy engine, etc.). On a cluster
+# whose CNI ignores NetworkPolicy, these render and apply cleanly but have
+# no effect - rclonegw-public's own --read-only/--include scoping remains
+# the backstop in that case.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: rclonegw
+  labels:
+    app.kubernetes.io/name: rclonegw
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: rclonegw
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: caddy
+      ports:
+        - port: 9000
+          protocol: TCP
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: rclonegw-public
+  labels:
+    app.kubernetes.io/name: rclonegw-public
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: rclonegw-public
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: caddy
+      ports:
+        - port: 9000
+          protocol: TCP
 {% endif %}
