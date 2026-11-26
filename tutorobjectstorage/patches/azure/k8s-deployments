@@ -52,7 +52,7 @@ spec:
 # Anonymous, read-only, scoped to the public bucket(s) only — see the
 # caddyfile and local-docker-compose-services patches for the full
 # rationale. This Deployment is reachable only from the Caddy pod: see
-# the k8s-override patch (NetworkPolicy) and the ClusterIP-only
+# the NetworkPolicy and the ClusterIP-only Services, both in the
 # k8s-services patch. Neither restriction is optional — tutor-rustfs's own
 # NodePort Service pattern, mirrored here without them, would let any pod
 # or node in the cluster reach this anonymous, read-only gateway directly,

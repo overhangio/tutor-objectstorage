@@ -25,7 +25,6 @@ from tests.conftest import BACKENDS, patch_names, read_patch, read_task_script
 YAML_PATCHES = {
     "k8s-deployments",
     "k8s-jobs",
-    "k8s-override",
     "k8s-services",
     "k8s-volumes",
     "local-docker-compose-caddy-aliases",
@@ -55,7 +54,6 @@ EXPECTED_EMPTY = {
     ("external_s3", "k8s-deployments"),
     ("external_s3", "k8s-services"),
     ("external_s3", "k8s-volumes"),
-    ("external_s3", "k8s-override"),
     ("external_s3", "local-docker-compose-services"),
     ("external_s3", "local-docker-compose-dev-services"),
     ("external_s3", "local-docker-compose-caddy-aliases"),
@@ -64,7 +62,6 @@ EXPECTED_EMPTY = {
     ("external_s3", "openedx-development-settings"),
     ("external_s3", "discovery-development-settings"),
     ("external_s3", "caddyfile"),
-    ("rustfs", "k8s-override"),
     ("azure", "k8s-volumes"),
 }
 
@@ -422,7 +419,6 @@ INFRA_PATCH_NAMES = [
     "caddyfile",
     "k8s-deployments",
     "k8s-services",
-    "k8s-override",
     "k8s-volumes",
     "local-docker-compose-services",
     "local-docker-compose-jobs-services",
@@ -446,6 +442,43 @@ def test_only_selected_backend_renders_into_infra_patches(
                     f"{marker!r} into {patch_name} - a missing "
                     f"{{% if OBJSTORAGE_BACKEND == ... %}} guard"
                 )
+
+
+# --- NetworkPolicy must come through a resources-backed hook ----------------
+# Regression guard for the real `tutor k8s start` failure: the Azure
+# NetworkPolicies were originally contributed via the `k8s-override` patch,
+# which Tutor core wires into kustomize's `patches:` (strategic-merge) list.
+# A strategic-merge patch can only modify a resource that already exists in
+# the base `resources:`; a brand-new NetworkPolicy has no such base, so
+# kustomize aborts with "no resource matches strategic merge patch
+# NetworkPolicy.v1.networking.k8s.io/rclonegw". They must instead be emitted
+# through a hook that core lists under `resources:` - k8s-deployments,
+# k8s-jobs, k8s-services, or k8s-volumes - so kustomize *creates* them.
+def test_azure_networkpolicies_render_in_a_resources_backed_hook(
+    renderer_by_backend: dict[str, tutor_env.Renderer],
+) -> None:
+    renderer = renderer_by_backend["azure"]
+    services = renderer.patch("k8s-services")
+    kinds = {
+        doc["kind"]: doc["metadata"]["name"]
+        for doc in yaml.safe_load_all(services)
+        if doc
+    }
+    nps = [
+        doc["metadata"]["name"]
+        for doc in yaml.safe_load_all(services)
+        if doc and doc.get("kind") == "NetworkPolicy"
+    ]
+    assert sorted(nps) == ["rclonegw", "rclonegw-public"], (
+        f"both gateway NetworkPolicies must render in the resources-backed "
+        f"k8s-services patch; got kinds {kinds}"
+    )
+    # And nothing may be left in the patches-backed k8s-override hook: a new
+    # resource there is exactly what broke `tutor k8s start`.
+    assert renderer.patch("k8s-override").strip() == "", (
+        "k8s-override is a strategic-merge (patches:) hook - it must not "
+        "carry any standalone resource for this plugin"
+    )
 
 
 @pytest.mark.parametrize("backend", BACKENDS)

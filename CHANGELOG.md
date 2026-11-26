@@ -4,6 +4,20 @@
 
 ## Unreleased
 
+- [Bugfix] `azure` backend: `tutor k8s start` no longer fails with
+  `no resource matches strategic merge patch
+  "NetworkPolicy.v1.networking.k8s.io/rclonegw"`. The two gateway
+  NetworkPolicies were being contributed through the `k8s-override` patch,
+  which Tutor core wires into kustomize's `patches:` (strategic-merge) list
+  — that can only *modify* a resource already present in the base, never
+  *introduce* a new one. They now render through the `k8s-services` patch
+  (appended to `k8s/services.yml`, which kustomize lists under `resources:`),
+  so kustomize creates them as it does every other resource. Behaviour is
+  unchanged on clusters whose CNI enforces NetworkPolicy; the manifests are
+  identical, only the hook they travel through differs. Reproduced on an AKS
+  staging cluster (Tutor 22.0.4) and verified against the rendered
+  kustomize build.
+
 - [Documentation] `MIGRATING.rst` now covers moving from `tutor-minio`
   (previously undocumented, and the most common starting point for existing
   deployments — it was bundled with Tutor's own binary releases for years).
